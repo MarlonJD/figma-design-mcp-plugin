@@ -1,88 +1,242 @@
 # DesignPort
 
-DesignPort is a local MCP bridge between coding agents and design hosts. It
-keeps the shared design model independent from Figma and Adobe XD, while each
-host contributes a small adapter plugin.
+DesignPort is a local MCP bridge that lets coding agents understand and work
+with designs in Figma and Adobe XD.
+
+It gives an agent structured design context instead of making the agent guess
+from screenshots. A designer can keep working in the tool they know, while an
+agent can read selections and screens, export a host-neutral design model, and
+generate a starting point for HTML or React.
+
+DesignPort is an early, local-first project. It is intentionally small enough
+to run on a designer's computer and clear enough to extend with more hosts and
+code-generation targets.
+
+## Why does this exist?
+
+Design files contain valuable implementation decisions: hierarchy, spacing,
+typography, colors, component boundaries, and screen relationships. Those
+decisions are difficult for an agent to recover reliably when the only input is
+a screenshot or a host-specific API dump.
+
+DesignPort separates the problem into three parts:
+
+1. A Figma or XD development plugin reads the open document.
+2. The local bridge normalizes that information into `DesignIR`, a shared
+   design representation.
+3. MCP tools make the context available to coding agents and expose carefully
+   scoped design operations.
+
+The result is a common path from design to implementation:
 
 ```text
-Codex / Claude
-      |
-      | MCP over stdio
-      v
-DesignPort server
-      |
-      | localhost WebSocket
-      +----------+----------+
-      |                     |
-  Figma plugin          XD plugin
-      |                     |
-  Figma API           XD scenegraph
+Figma / Adobe XD
+        |
+        | host plugin over localhost WebSocket
+        v
+DesignPort bridge + MCP server
+        |
+        | DesignIR
+        v
+Codex / Claude / another MCP client
+        |
+        v
+HTML / React / future targets
 ```
 
-## Current slice
+The shared model is the important part. Figma-specific and XD-specific details
+stay at the edge, so adding another host does not require rewriting the agent
+integration.
 
-- Versioned `DesignIR` for documents, screens, nodes, selection, styles, and
-  host capabilities.
-- Local WebSocket bridge with host registration, request/response correlation,
-  reconnect-safe session cleanup, and bounded request timeouts.
-- MCP tools for host discovery, context reads, IR export, screen/component
-  creation, and selection updates.
-- Adobe XD development plugin with document/selection export and basic shape,
-  text, and artboard operations.
-- Figma development plugin using the same bridge protocol and IR shape.
-- Unit tests for protocol validation, IR normalization, and bridge routing.
+## What it can do today
 
-## Run the server
+- Connect a Figma development plugin and an Adobe XD UXP development plugin.
+- Read the current selection or a screen/artboard.
+- Export a full document or a scoped `DesignIR` snapshot.
+- Report connected hosts, capabilities, and recent host events.
+- Generate a self-contained HTML export or a small React component and CSS
+  file.
+- Create screens and basic components through host adapters.
+- Apply a normalized patch to the current selection.
+- Keep the bridge on loopback (`127.0.0.1`) by default.
+
+The available MCP tools are:
+
+| Tool | Purpose |
+| --- | --- |
+| `design.list_hosts` | List connected Figma and XD plugins. |
+| `design.list_events` | Read recent selection, document, and write events. |
+| `design.get_capabilities` | Inspect what a connected host supports. |
+| `design.get_selection_context` | Read the current selection as normalized nodes. |
+| `design.get_screen_context` | Read one screen/artboard and its descendants. |
+| `design.export_ir` | Export document, selection, or screen context. |
+| `design.generate_code` | Generate HTML or React from exported context. |
+| `design.create_screen` | Create an artboard/screen. |
+| `design.create_component` | Create a basic component or symbol where supported. |
+| `design.update_selection` | Apply a normalized patch to the current selection. |
+| `design.ping` | Check that a host can receive requests. |
+
+See [EXAMPLES.md](EXAMPLES.md) for ready-to-copy tool arguments and common
+workflows.
+
+## Requirements
+
+- Node.js 20 or newer and npm.
+- Figma Desktop for the Figma adapter.
+- Adobe XD and Adobe UXP Developer Tool for the XD adapter.
+- An MCP client that can launch a local stdio server, such as Codex or Claude.
+
+The XD adapter is development-plugin based. It is not distributed through the
+Adobe XD Marketplace.
+
+## Installation
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/MarlonJD/figma-design-mcp-plugin.git
+cd figma-design-mcp-plugin
+```
+
+### 2. Install dependencies and verify the project
 
 ```bash
 npm install
 npm test
 npm run typecheck
 npm run build
+```
+
+The build output is written to `dist/` and is intentionally ignored by Git.
+
+### 3. Start the local bridge
+
+```bash
 npm start
 ```
 
-The process exposes MCP over stdin/stdout and starts the bridge on
-`127.0.0.1:5514`. Configure an MCP client with:
+The process exposes MCP over stdin/stdout and opens the host-plugin bridge at
+`ws://127.0.0.1:5514`.
+
+To use a different local port or request timeout, set environment variables
+before starting the process:
+
+```bash
+DESIGNPORT_PORT=5515 DESIGNPORT_REQUEST_TIMEOUT_MS=30000 npm start
+```
+
+The available variables are documented in [.env.example](.env.example). The
+server reads them from the process environment; it does not load `.env` files
+automatically.
+
+### 4. Configure the MCP client
+
+Build the project first, then point the MCP client at the compiled entrypoint.
+Use an absolute path:
 
 ```json
 {
   "mcpServers": {
     "designport": {
       "command": "node",
-      "args": ["/absolute/path/to/designport/dist/src/index.js"]
+      "args": [
+        "/absolute/path/to/figma-design-mcp-plugin/dist/src/index.js"
+      ]
     }
   }
 }
 ```
 
-For local development, `npm run dev` starts the TypeScript entrypoint
-directly.
+The MCP client starts one server process for its session. Start the DesignPort
+process manually only when you are connecting a design plugin for a direct
+development test; otherwise configure the MCP client and let it launch the
+server.
 
-## Load the plugins
+### 5. Load a design host plugin
 
-### Adobe XD
+The bridge must be running before the plugin connects.
 
-Load `plugins/xd` through Adobe UXP Developer Tool. The plugin connects to the
-bridge at `ws://127.0.0.1:5514` and exposes the same operations as the MCP
-server. `design.update_selection` is intentionally treated as a capability:
-the plugin queues a write when XD requires a user-initiated edit context and
-the panel provides an explicit Apply action.
+#### Figma
 
-### Figma
+1. Open Figma Desktop.
+2. Open **Plugins → Development → Import plugin from manifest…**.
+3. Select `plugins/figma/manifest.json` from this repository.
+4. Run **DesignPort Figma** from **Plugins → Development**.
 
-Import `plugins/figma/manifest.json` as a development plugin. The plugin keeps
-the network connection in its hidden UI iframe and executes document changes
-in the Figma plugin sandbox.
+The plugin uses a hidden UI iframe for the localhost WebSocket connection, so
+no permanent panel is expected. Ask the MCP client to call
+`design.list_hosts`; it should report a connected `figma` host.
 
-## Design decisions
+#### Adobe XD
 
-The IR contains only cross-host concepts: document, screen, group, shape,
-text, component, instance, bounds, fills, typography, layout, and prototype
-links. Host-specific properties live under `hostData` and are never required
-by the common MCP tools. Adapters advertise actual capabilities rather than
-pretending that Figma components and XD symbols are identical.
+1. Install and open Adobe UXP Developer Tool.
+2. Add the `plugins/xd` folder as a development plugin.
+3. Launch Adobe XD and load the **DesignPort** command or panel.
+4. Keep the DesignPort bridge running while using the panel.
 
-The bridge is local by default. A future remote deployment must add an
-authenticated `wss://` transport; the current server deliberately does not
-listen on non-loopback interfaces.
+XD read operations are available immediately. XD write requests are queued and
+must be applied from the panel inside a user-initiated edit context.
+
+## First useful workflow
+
+With the bridge and one plugin connected, ask the MCP client to:
+
+1. Call `design.get_selection_context` for the selected design.
+2. Call `design.get_screen_context` for the selected screen/artboard.
+3. Call `design.generate_code` with `target: "react"` for a first-pass
+   implementation.
+4. Use the generated output as a starting point, then refine behavior and
+   accessibility in application code.
+
+The generator is deliberately a starter generator. It preserves useful
+geometry, fills, typography, and hierarchy, but it is not a promise of
+production-ready UI code.
+
+## Development
+
+Run the TypeScript entrypoint directly during development:
+
+```bash
+npm run dev
+```
+
+Before opening a pull request, run:
+
+```bash
+npm test
+npm run typecheck
+npm run build
+git diff --check
+```
+
+The project layout is intentionally simple:
+
+```text
+src/core/       DesignIR and protocol contracts
+src/bridge/     Local WebSocket host bridge
+src/mcp/        MCP tool registration
+src/codegen/    HTML and React generation
+plugins/figma/  Figma development plugin
+plugins/xd/     Adobe XD UXP development plugin
+test/           Protocol, IR, bridge, and generator tests
+```
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before changing the protocol or adding
+a host adapter.
+
+## Security and data handling
+
+The server listens on loopback by default and is designed for a trusted local
+machine. A connected plugin can send design context to the local MCP process,
+and write tools can modify the active design document. Do not bind the bridge
+to a public interface without adding authentication and an explicit threat
+model.
+
+See [SECURITY.md](SECURITY.md) for reporting guidance and operational rules.
+
+## License
+
+Copyright (C) 2026 Burak Karahan.
+
+DesignPort is licensed under the GNU General Public License v3.0 or any later
+version. See [LICENSE](LICENSE).

@@ -2,6 +2,7 @@
   "name": "designport",
   "version": "0.1.0",
   "private": true,
+  "license": "GPL-3.0-or-later",
   "description": "Local MCP bridge for Figma and Adobe XD design context.",
   "type": "module",
   "main": "dist/src/index.js",

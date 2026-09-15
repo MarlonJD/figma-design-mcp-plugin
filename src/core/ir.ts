@@ -82,8 +82,8 @@ export const layoutSchema = z.object({
       left: z.number().finite().nonnegative(),
     })
     .optional(),
-  primarySizing: z.enum(["fixed", "hug", "fill"]).optional(),
-  counterSizing: z.enum(["fixed", "hug", "fill"]).optional(),
+  sizingHorizontal: z.enum(["fixed", "hug", "fill"]).optional(),
+  sizingVertical: z.enum(["fixed", "hug", "fill"]).optional(),
 });
 export type Layout = z.infer<typeof layoutSchema>;
 

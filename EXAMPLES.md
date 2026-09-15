@@ -137,6 +137,137 @@ The result contains `DesignPortScreen.tsx` and `DesignPortScreen.css`. Treat
 these as a first pass: wire real data, keyboard behavior, responsive rules,
 and accessibility semantics in the application that consumes them.
 
+## Generate a web export
+
+Use the `web` target when you want a conventional browser output with a
+separate stylesheet:
+
+```json
+{
+  "tool": "design.generate_code",
+  "arguments": {
+    "host": "figma",
+    "scope": "screen",
+    "screenId": "SCREEN_ID_FROM_CONTEXT",
+    "target": "web"
+  }
+}
+```
+
+The result contains `index.html` and `styles.css`. The `html` target shown
+above is the single-file alternative.
+
+## Generate Vue
+
+```json
+{
+  "tool": "design.generate_code",
+  "arguments": {
+    "host": "figma",
+    "scope": "screen",
+    "screenId": "SCREEN_ID_FROM_CONTEXT",
+    "target": "vue"
+  }
+}
+```
+
+The result contains `DesignPortScreen.vue`, a Vue single-file component with a
+template and scoped styles.
+
+## Generate Flutter
+
+```json
+{
+  "tool": "design.generate_code",
+  "arguments": {
+    "host": "figma",
+    "scope": "screen",
+    "screenId": "SCREEN_ID_FROM_CONTEXT",
+    "target": "flutter"
+  }
+}
+```
+
+The result contains `design_port_screen.dart` with a `DesignPortApp` entry point
+and a `DesignPortScreen` `StatelessWidget`. It uses the official standalone
+`cupertino_ui` package (Flutter 3.47+, currently `1.0.2`), not SwiftUI or
+Material. Add the dependency before importing the generated file:
+
+```bash
+flutter add cupertino_ui
+```
+
+Auto-layout rows and columns become `Row`/`Column`; fill-sized siblings become
+`Expanded`, and hug-sized siblings become `Flexible`.
+
+## Generate SwiftUI
+
+```json
+{
+  "tool": "design.generate_code",
+  "arguments": {
+    "host": "figma",
+    "scope": "screen",
+    "screenId": "SCREEN_ID_FROM_CONTEXT",
+    "target": "swiftui"
+  }
+}
+```
+
+The result contains `DesignPortScreen.swift` with a SwiftUI `View` and a
+preview. It targets iOS 26+/macOS 26+ Liquid Glass APIs and keeps a material
+fallback for older deployment targets. Add it to an iOS or macOS target and
+replace the static placeholders with application data and behavior.
+
+## Generate Jetpack Compose
+
+```json
+{
+  "tool": "design.generate_code",
+  "arguments": {
+    "host": "figma",
+    "scope": "screen",
+    "screenId": "SCREEN_ID_FROM_CONTEXT",
+    "target": "compose"
+  }
+}
+```
+
+The result contains `DesignPortScreen.kt` with a `@Composable` function. Add
+the file to an Android Compose module with the latest stable Material 3
+dependency used by this generator:
+
+```kotlin
+implementation("androidx.compose.material3:material3:1.4.0")
+```
+
+The generated theme uses Material 3 dynamic color on Android 12+ and falls
+back to light/dark Material 3 schemes on older Android versions. Auto-layout
+rows and columns become `Row`/`Column`; fill-sized siblings become
+`weight(1f)`.
+
+## Generate a responsive split layout
+
+For a screen with a fixed sidebar and a fill-sized main panel, expose the
+screen's layout metadata in `DesignIR` (Figma Auto Layout does this directly):
+
+```json
+{
+  "layout": {
+    "mode": "horizontal",
+    "gap": 24,
+    "padding": { "top": 24, "right": 24, "bottom": 24, "left": 24 }
+  }
+}
+```
+
+Mark the sidebar as `sizingHorizontal: "fixed"` and the main panel as
+`sizingHorizontal: "fill"`. The same MCP call then produces CSS flex, Flutter
+`Row` + `Expanded`, SwiftUI `HStack` + an infinite-width frame, and Compose
+`Row` + `weight(1f)`. The agent can use the returned `DesignIR` properties to
+review or refine the result instead of reverse-engineering the layout from a
+screenshot.
+
 ## Create a screen
 
 Use a scratch document while testing write operations:

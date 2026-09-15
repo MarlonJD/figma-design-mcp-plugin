@@ -6,7 +6,8 @@ with designs in Figma and Adobe XD.
 It gives an agent structured design context instead of making the agent guess
 from screenshots. A designer can keep working in the tool they know, while an
 agent can read selections and screens, export a host-neutral design model, and
-generate a starting point for HTML or React.
+generate a starting point for web, React, Vue, Flutter, SwiftUI, or Jetpack
+Compose.
 
 DesignPort is an early, local-first project. It is intentionally small enough
 to run on a designer's computer and clear enough to extend with more hosts and
@@ -54,8 +55,8 @@ integration.
 - Read the current selection or a screen/artboard.
 - Export a full document or a scoped `DesignIR` snapshot.
 - Report connected hosts, capabilities, and recent host events.
-- Generate a self-contained HTML export or a small React component and CSS
-  file.
+- Generate a web export, a self-contained HTML export, or starter code for
+  React, Vue, Flutter, SwiftUI, and Jetpack Compose.
 - Create screens and basic components through host adapters.
 - Apply a normalized patch to the current selection.
 - Keep the bridge on loopback (`127.0.0.1`) by default.
@@ -70,7 +71,7 @@ The available MCP tools are:
 | `design.get_selection_context` | Read the current selection as normalized nodes. |
 | `design.get_screen_context` | Read one screen/artboard and its descendants. |
 | `design.export_ir` | Export document, selection, or screen context. |
-| `design.generate_code` | Generate HTML or React from exported context. |
+| `design.generate_code` | Generate web, HTML, React, Vue, Flutter, SwiftUI, or Compose code. |
 | `design.create_screen` | Create an artboard/screen. |
 | `design.create_component` | Create a basic component or symbol where supported. |
 | `design.update_selection` | Apply a normalized patch to the current selection. |
@@ -78,6 +79,45 @@ The available MCP tools are:
 
 See [EXAMPLES.md](EXAMPLES.md) for ready-to-copy tool arguments and common
 workflows.
+
+### Code generation targets
+
+| Target | Files returned | Intended use |
+| --- | --- | --- |
+| `web` | `index.html`, `styles.css` | A normal two-file browser export. |
+| `html` | `designport-export.html` | A self-contained browser preview. |
+| `react` | `DesignPortScreen.tsx`, `DesignPortScreen.css` | React application starter. |
+| `vue` | `DesignPortScreen.vue` | Vue single-file component starter. |
+| `flutter` | `design_port_screen.dart` | Flutter widget starter. |
+| `swiftui` | `DesignPortScreen.swift` | SwiftUI view starter. |
+| `compose` | `DesignPortScreen.kt` | Jetpack Compose composable starter. |
+
+Every target is generated from the same `DesignIR` snapshot. The mobile and
+UI-framework outputs preserve geometry, colors, typography, and hierarchy as a
+semantic first pass; application behavior, assets, and final accessibility
+still need to be wired in the destination project.
+
+### Semantic layout generation
+
+Code generation is not a screenshot-to-pixels conversion. The generator uses
+the host's explicit layout metadata first, including direction, gap, padding,
+and fixed/hug/fill sizing. If a host does not expose that metadata, it makes a
+conservative sibling-layout inference. Coordinates are retained only as the
+fallback for genuinely free-form or ambiguous placement.
+
+The same layout plan maps to the native primitive for each target:
+
+| Design intent | Web / React / Vue | Flutter | SwiftUI | Compose |
+| --- | --- | --- | --- | --- |
+| Horizontal flow | CSS `flex-direction: row` | `Row` | `HStack` | `Row` |
+| Vertical flow | CSS `flex-direction: column` | `Column` | `VStack` | `Column` |
+| Fill remaining space | `flex: 1 1 0` | `Expanded` | `frame(maxWidth/maxHeight: .infinity)` | `weight(1f)` |
+| Grid-like flow | CSS grid | `Wrap` | `LazyVGrid` | rows of weighted `Row`s |
+
+Current native UI baselines are intentionally modern: Flutter uses the
+official `cupertino_ui` package, SwiftUI emits iOS 26+/macOS 26+ Liquid Glass
+APIs with a fallback, and Compose uses the latest stable Material 3 dependency
+with dynamic color and `Scaffold`.
 
 ## Requirements
 
@@ -183,14 +223,15 @@ With the bridge and one plugin connected, ask the MCP client to:
 
 1. Call `design.get_selection_context` for the selected design.
 2. Call `design.get_screen_context` for the selected screen/artboard.
-3. Call `design.generate_code` with `target: "react"` for a first-pass
-   implementation.
+3. Call `design.generate_code` with `target: "react"` or one of the native
+   targets for a first-pass implementation.
 4. Use the generated output as a starting point, then refine behavior and
    accessibility in application code.
 
-The generator is deliberately a starter generator. It preserves useful
-geometry, fills, typography, and hierarchy, but it is not a promise of
-production-ready UI code.
+The generator is deliberately a starter generator. It preserves useful layout
+semantics, geometry, fills, typography, and hierarchy, but it is not a promise
+of production-ready UI code. See the target-specific examples in
+[EXAMPLES.md](EXAMPLES.md).
 
 ## Development
 
@@ -215,7 +256,7 @@ The project layout is intentionally simple:
 src/core/       DesignIR and protocol contracts
 src/bridge/     Local WebSocket host bridge
 src/mcp/        MCP tool registration
-src/codegen/    HTML and React generation
+src/codegen/    Web and cross-platform code generation
 plugins/figma/  Figma development plugin
 plugins/xd/     Adobe XD UXP development plugin
 test/           Protocol, IR, bridge, and generator tests

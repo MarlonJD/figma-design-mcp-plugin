@@ -102,9 +102,20 @@ function typographyFor(node) {
 }
 
 function layoutFor(node) {
-  if (!node.layoutMode || node.layoutMode === "NONE") return undefined;
+  const sizing = (value) => {
+    if (value === "FIXED" || value === "HUG" || value === "FILL") {
+      return value.toLowerCase();
+    }
+    return undefined;
+  };
+  const mode = node.layoutMode && node.layoutMode !== "NONE"
+    ? node.layoutMode.toLowerCase()
+    : "none";
+  const sizingHorizontal = sizing(node.layoutSizingHorizontal);
+  const sizingVertical = sizing(node.layoutSizingVertical);
+  if (mode === "none" && !sizingHorizontal && !sizingVertical) return undefined;
   return {
-    mode: node.layoutMode.toLowerCase(),
+    mode,
     ...(typeof node.itemSpacing === "number" ? { gap: node.itemSpacing } : {}),
     padding: {
       top: Number(node.paddingTop) || 0,
@@ -112,6 +123,8 @@ function layoutFor(node) {
       bottom: Number(node.paddingBottom) || 0,
       left: Number(node.paddingLeft) || 0,
     },
+    ...(sizingHorizontal ? { sizingHorizontal } : {}),
+    ...(sizingVertical ? { sizingVertical } : {}),
   };
 }
 

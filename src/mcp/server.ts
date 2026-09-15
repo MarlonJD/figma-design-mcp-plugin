@@ -39,7 +39,7 @@ const exportInput = hostInput.extend({
 });
 
 const generateCodeInput = exportInput.extend({
-  target: z.enum(["html", "react"]).default("html"),
+  target: z.enum(["html", "web", "react", "vue", "flutter", "swiftui", "compose"]).default("web"),
 });
 
 function jsonResult(value: unknown) {
@@ -176,8 +176,8 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
   server.registerTool(
     "design.generate_code",
     {
-      title: "Generate HTML or React",
-      description: "Export DesignIR from a host and generate a small HTML or React implementation.",
+      title: "Generate application code",
+      description: "Export DesignIR from a host and generate a semantic starter implementation for web, React, Vue, Flutter Cupertino, SwiftUI, or Jetpack Compose. Layout metadata maps to flex, Row/Column, stacks, and fill-sized children where possible.",
       inputSchema: generateCodeInput.shape,
     },
     async ({ host, scope, screenId, target }) => {

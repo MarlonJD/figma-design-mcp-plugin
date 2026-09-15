@@ -30,6 +30,9 @@ Each node can carry several independent layers:
   asset is represented by the node without a fabricated replacement.
 - `asset.byteSize`, `pagination`, and `exportStats` make the context budget
   observable to an agent instead of hiding omitted data.
+- `snapshot` carries the document/selection revisions and an opaque ID for
+  incremental reads. `unchanged` means the requested snapshot is already known;
+  `partial` means the response is a changed-only or paginated subset.
 
 The host-specific escape hatch is `hostData`. It is for useful information that
 does not yet belong in the shared vocabulary; consumers should not depend on it
@@ -64,7 +67,8 @@ All context/export tools accept:
   "nodeOffset": 0,
   "includeAssets": true,
   "maxAssetBytes": 2000000,
-  "includeTokens": true
+  "includeTokens": true,
+  "detail": "full"
 }
 ```
 
@@ -72,6 +76,39 @@ The response reports `pagination` and `exportStats`. A caller should continue
 with `pagination.nextOffset` while `hasMore` is true. Asset and token omission
 is observable, so an agent can request a second pass instead of silently
 assuming the first response was complete.
+
+### Detail modes and incremental snapshots
+
+Use `detail: "summary"` for hierarchy, bounds, and responsive layout signals;
+`detail: "structure"` adds tokens/style bindings, component state, text
+ranges, accessibility, and prototype links; `detail: "full"` also includes
+visual styling and embedded assets. The host plugins keep snapshot IDs stable
+for their current plugin session and include the export shape in the ID.
+
+Send a previously returned `snapshot.id` as `knownSnapshotId` to ask whether
+that exact revision and shape is still current. An unchanged response has no
+node payload to merge. Send `changedOnly: true` with an older snapshot ID to
+receive the observed changed nodes; merge those nodes by ID and retain the
+rest of the cached snapshot. Remove IDs in `snapshot.deletedNodeIds`. A
+changed-only response is explicitly `partial`.
+Figma records document-change events. XD records plugin writes and selection
+revisions; external XD edits should be re-read as a complete context when the
+plugin reports a new host state.
+
+## Semantic audit and graph
+
+`design.audit_context` runs a deterministic check over the exported evidence.
+It reports actionable diagnostics for flow/absolute conflicts, growth without a
+flow parent, missing layout metadata, unlabeled interactive content, missing
+visual alternatives, incomplete heading metadata, unresolved interactions,
+component references, and token references. An audit over a paginated or
+changed-only export is marked `partial`, so it is not a claim that the unseen
+document is clean.
+
+`design.get_graph` extracts reusable component/instance relationships,
+variant/state values, screen viewports, and prototype interaction edges. It is a
+compact companion to the node-level IR and is useful for building an agent's
+component and navigation plan before implementation.
 
 ## Visual qualification
 
@@ -83,9 +120,12 @@ npm run visual:compare -- reference.png candidate.png --json
 ```
 
 The result includes dimensions, mean absolute error, changed-pixel ratio,
-similarity, and `changedBounds`. Use the metrics to select the next fix while
-preserving the semantic layout model. The evaluator is deliberately local and
-framework-agnostic; it does not generate code or mutate a design document.
+similarity, `changedBounds`, and regional metrics. Use `--regions=8x8` to
+partition the viewport, `--heatmap-output=...` to save a difference heatmap,
+and `--overlay-output=...` to save a reference/candidate overlay. Use the
+metrics to select the next fix while preserving the semantic layout model. The
+evaluator is deliberately local and framework-agnostic; it does not generate
+code or mutate a design document.
 
 ## Host limitations
 

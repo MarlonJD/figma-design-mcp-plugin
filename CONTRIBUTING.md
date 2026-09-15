@@ -55,8 +55,12 @@ git diff --check
 When a screenshot fixture is available, also run:
 
 ```bash
-npm run visual:compare -- reference.png candidate.png
+npm run visual:compare -- reference.png candidate.png --regions=8x8
 ```
+
+Use `--heatmap-output` and `--overlay-output` when a review needs visual
+evidence for the mismatch. Keep generated artifacts outside the repository or
+under an ignored directory.
 
 For plugin changes, also run the host-specific syntax checks where available:
 
@@ -77,6 +81,10 @@ someone else's production design file.
 4. Implement the operation in each host plugin that genuinely supports it.
 5. Update the tool table in the README and add a copyable example to
    `EXAMPLES.md`.
+
+For context/export changes, preserve the distinction between a complete
+snapshot, a paginated response, and a changed-only response. Update the IR
+guide when adding fields that affect cache merging or semantic interpretation.
 
 If a host cannot support the operation, return a truthful capability or error;
 do not silently emulate a different design concept.

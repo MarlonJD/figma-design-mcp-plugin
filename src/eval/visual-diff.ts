@@ -10,6 +10,8 @@ export interface VisualDiffOptions {
   pixelThreshold?: number;
   maxMeanAbsoluteError?: number;
   maxChangedPixelRatio?: number;
+  regionColumns?: number;
+  regionRows?: number;
 }
 
 export interface DiffBounds {
@@ -17,6 +19,12 @@ export interface DiffBounds {
   y: number;
   width: number;
   height: number;
+}
+
+export interface DiffRegion extends DiffBounds {
+  meanAbsoluteError: number;
+  changedPixelRatio: number;
+  similarity: number;
 }
 
 export interface VisualDiffResult {
@@ -32,6 +40,7 @@ export interface VisualDiffResult {
   maxChannelError: number;
   similarity: number;
   changedBounds: DiffBounds | null;
+  regions: DiffRegion[];
 }
 
 const PNG_SIGNATURE = new Uint8Array([
@@ -272,6 +281,11 @@ function compositedChannel(pixels: Uint8Array, offset: number, channel: number):
   return pixels[offset + channel]! * alpha + 255 * (1 - alpha);
 }
 
+function regionCount(value: number | undefined, maximum: number): number {
+  const requested = Number.isFinite(value) ? Math.floor(value as number) : 8;
+  return Math.max(1, Math.min(maximum, 32, requested));
+}
+
 export function comparePngBuffers(
   referenceBuffer: Uint8Array,
   candidateBuffer: Uint8Array,
@@ -294,12 +308,19 @@ export function comparePngBuffers(
       maxChannelError: 1,
       similarity: 0,
       changedBounds: null,
+      regions: [],
     };
   }
 
   const pixelThreshold = Math.max(0, Math.min(1, options.pixelThreshold ?? 0.05));
   const maxMeanAbsoluteError = Math.max(0, Math.min(1, options.maxMeanAbsoluteError ?? 0.02));
   const maxChangedPixelRatio = Math.max(0, Math.min(1, options.maxChangedPixelRatio ?? 0.05));
+  const regionColumns = regionCount(options.regionColumns, reference.width);
+  const regionRows = regionCount(options.regionRows, reference.height);
+  const regionStats = Array.from(
+    { length: regionColumns * regionRows },
+    () => ({ error: 0, pixels: 0, changed: 0 }),
+  );
   const pixelCount = reference.width * reference.height;
   let totalError = 0;
   let changedPixels = 0;
@@ -313,18 +334,24 @@ export function comparePngBuffers(
   for (let y = 0; y < reference.height; y += 1) {
     for (let x = 0; x < reference.width; x += 1) {
       const offset = (y * reference.width + x) * 4;
+      const regionColumn = Math.min(regionColumns - 1, Math.floor((x * regionColumns) / reference.width));
+      const regionRow = Math.min(regionRows - 1, Math.floor((y * regionRows) / reference.height));
+      const region = regionStats[regionRow * regionColumns + regionColumn]!;
+      region.pixels += 1;
       let pixelMaxError = 0;
       for (let channel = 0; channel < 3; channel += 1) {
         const referenceValue = compositedChannel(reference.pixels, offset, channel);
         const candidateValue = compositedChannel(candidate.pixels, offset, channel);
         const error = Math.abs(referenceValue - candidateValue) / 255;
         totalError += error;
+        region.error += error;
         pixelMaxError = Math.max(pixelMaxError, error);
         maxChannelError = Math.max(maxChannelError, error);
       }
       if (pixelMaxError <= Number.EPSILON) exactPixels += 1;
       if (pixelMaxError > pixelThreshold) {
         changedPixels += 1;
+        region.changed += 1;
         minX = Math.min(minX, x);
         minY = Math.min(minY, y);
         maxX = Math.max(maxX, x);
@@ -339,6 +366,24 @@ export function comparePngBuffers(
   const changedBounds = maxX >= 0 && maxY >= 0
     ? { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 }
     : null;
+  const regions = regionStats.map((stats, index) => {
+    const column = index % regionColumns;
+    const row = Math.floor(index / regionColumns);
+    const x = Math.floor((column * reference.width) / regionColumns);
+    const y = Math.floor((row * reference.height) / regionRows);
+    const nextX = Math.floor(((column + 1) * reference.width) / regionColumns);
+    const nextY = Math.floor(((row + 1) * reference.height) / regionRows);
+    const meanRegionError = stats.pixels ? stats.error / (stats.pixels * 3) : 0;
+    return {
+      x,
+      y,
+      width: nextX - x,
+      height: nextY - y,
+      meanAbsoluteError: meanRegionError,
+      changedPixelRatio: stats.pixels ? stats.changed / stats.pixels : 0,
+      similarity: Math.max(0, 1 - meanRegionError),
+    };
+  });
   return {
     pass: meanAbsoluteError <= maxMeanAbsoluteError && changedPixelRatio <= maxChangedPixelRatio,
     width: reference.width,
@@ -352,5 +397,40 @@ export function comparePngBuffers(
     maxChannelError,
     similarity: Math.max(0, 1 - meanAbsoluteError),
     changedBounds,
+    regions,
   };
+}
+
+export function createDiffPng(
+  referenceBuffer: Uint8Array,
+  candidateBuffer: Uint8Array,
+  kind: "heatmap" | "overlay",
+): Buffer {
+  const reference = decodePng(referenceBuffer);
+  const candidate = decodePng(candidateBuffer);
+  if (reference.width !== candidate.width || reference.height !== candidate.height) {
+    throw new Error("Cannot create a visual diff image for different dimensions");
+  }
+  const pixels = new Uint8Array(reference.pixels.length);
+  for (let index = 0; index < reference.width * reference.height; index += 1) {
+    const offset = index * 4;
+    const referenceChannels = [0, 1, 2].map((channel) => compositedChannel(reference.pixels, offset, channel));
+    const candidateChannels = [0, 1, 2].map((channel) => compositedChannel(candidate.pixels, offset, channel));
+    if (kind === "overlay") {
+      pixels[offset] = Math.round((referenceChannels[0]! + candidateChannels[0]!) / 2);
+      pixels[offset + 1] = Math.round((referenceChannels[1]! + candidateChannels[1]!) / 2);
+      pixels[offset + 2] = Math.round((referenceChannels[2]! + candidateChannels[2]!) / 2);
+    } else {
+      const error = Math.max(
+        Math.abs(referenceChannels[0]! - candidateChannels[0]!),
+        Math.abs(referenceChannels[1]! - candidateChannels[1]!),
+        Math.abs(referenceChannels[2]! - candidateChannels[2]!),
+      ) / 255;
+      pixels[offset] = 255;
+      pixels[offset + 1] = Math.round(255 * (1 - error));
+      pixels[offset + 2] = Math.round(255 * (1 - error));
+    }
+    pixels[offset + 3] = 255;
+  }
+  return encodePng({ width: reference.width, height: reference.height, pixels });
 }

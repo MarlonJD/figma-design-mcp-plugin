@@ -30,6 +30,13 @@ as a JSON array when a project has a token source outside XD. If a project
 stores portable style identifiers or variable aliases in XD plugin data,
 `styleRefs` and `variableBindings` are preserved as well.
 
+Exports support `detail` (`summary`, `structure`, or `full`), pagination, and
+session-stable `snapshot` revisions. Reuse `knownSnapshotId` to get an
+`unchanged: true` response or use `changedOnly` to get observed plugin-write
+and selection changes for a cache merge. XD's public UXP surface does not
+provide a generic document-change event, so external edits should be followed
+by a fresh complete export.
+
 XD does not expose an API for creating a new component definition or
 `SymbolInstance` directly. The adapter reports that capability as unsupported
 instead of pretending that a plain group is a component.

@@ -6,7 +6,7 @@ const application = require("application");
 const { Artboard, Rectangle, Text, Color } = scenegraph;
 
 const BRIDGE_URL = "ws://127.0.0.1:5514";
-const PLUGIN_VERSION = "0.2.0";
+const PLUGIN_VERSION = "0.3.0";
 const MAX_ASSET_EXPORTS_PER_REQUEST = 64;
 
 const CAPABILITIES = {
@@ -22,6 +22,7 @@ const CAPABILITIES = {
     "responsive-layout",
     "asset-export",
     "pagination",
+    "incremental-snapshots",
   ],
   limitations: [
     "component-creation-unsupported",
@@ -56,10 +57,20 @@ const DEFAULT_EXPORT_OPTIONS = {
   includeAssets: true,
   maxAssetBytes: 4000000,
   includeTokens: true,
+  detail: "full",
+  changedOnly: false,
 };
 
 const assetCache = new Map();
 const assetPromises = new Map();
+const snapshotState = {
+  sessionId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+  documentRevision: 0,
+  selectionRevision: 0,
+  selectionKey: "",
+  changeLog: [],
+  snapshots: new Map(),
+};
 
 const state = {
   socket: null,
@@ -104,7 +115,114 @@ function exportOptionsFor(payload) {
       ? Math.min(50000000, input.maxAssetBytes)
       : DEFAULT_EXPORT_OPTIONS.maxAssetBytes,
     includeTokens: input.includeTokens !== false,
+    detail: input.detail === "summary" || input.detail === "structure" || input.detail === "full"
+      ? input.detail
+      : DEFAULT_EXPORT_OPTIONS.detail,
+    ...(typeof input.knownSnapshotId === "string" && input.knownSnapshotId.trim()
+      ? { knownSnapshotId: input.knownSnapshotId.trim() }
+      : {}),
+    changedOnly: input.changedOnly === true,
   };
+}
+
+function rememberChangedNodeIds(ids, deletedIds) {
+  const normalized = Array.from(new Set(
+    (Array.isArray(ids) ? ids : [ids]).filter((id) => typeof id === "string" && id),
+  ));
+  const deleted = Array.from(new Set(
+    (Array.isArray(deletedIds) ? deletedIds : [deletedIds]).filter((id) => typeof id === "string" && id),
+  ));
+  if (!normalized.length && !deleted.length) return;
+  snapshotState.changeLog.push({
+    documentRevision: snapshotState.documentRevision,
+    selectionRevision: snapshotState.selectionRevision,
+    ids: normalized,
+    deletedIds: deleted,
+  });
+  if (snapshotState.changeLog.length > 256) snapshotState.changeLog.shift();
+}
+
+function syncSelectionRevision() {
+  const items = selectionItems();
+  const key = items.map((item) => nodeId(item)).filter(Boolean).join(",");
+  if (key === snapshotState.selectionKey) return;
+  snapshotState.selectionKey = key;
+  snapshotState.selectionRevision += 1;
+  rememberChangedNodeIds(items.map((item) => nodeId(item)));
+}
+
+function snapshotFor(scope, screenId, options) {
+  syncSelectionRevision();
+  const info = documentInfo();
+  const optionKey = [
+    options.detail,
+    options.includeAssets,
+    options.maxAssetBytes,
+    options.includeTokens,
+  ].join(":");
+  const id = [
+    snapshotState.sessionId,
+    info.documentId,
+    snapshotState.documentRevision,
+    snapshotState.selectionRevision,
+    scope,
+    screenId || "",
+    optionKey,
+  ].join("|");
+  const known = options.knownSnapshotId
+    ? snapshotState.snapshots.get(options.knownSnapshotId)
+    : undefined;
+  const changedNodeIds = new Set();
+  const deletedNodeIds = new Set();
+  snapshotState.changeLog.forEach((change) => {
+    if (!known
+      || change.documentRevision > known.documentRevision
+      || change.selectionRevision > known.selectionRevision) {
+      change.ids.forEach((nodeId) => changedNodeIds.add(nodeId));
+      change.deletedIds.forEach((nodeId) => deletedNodeIds.add(nodeId));
+    }
+  });
+  deletedNodeIds.forEach((nodeId) => changedNodeIds.delete(nodeId));
+  const snapshot = {
+    id,
+    scope,
+    documentRevision: snapshotState.documentRevision,
+    selectionRevision: snapshotState.selectionRevision,
+    ...(screenId ? { screenId } : {}),
+    ...(changedNodeIds.size
+      ? { changedNodeIds: Array.from(changedNodeIds).slice(-2000) }
+      : {}),
+    ...(deletedNodeIds.size
+      ? { deletedNodeIds: Array.from(deletedNodeIds).slice(-2000) }
+      : {}),
+    generatedAt: new Date().toISOString(),
+  };
+  snapshotState.snapshots.set(id, {
+    documentRevision: snapshot.documentRevision,
+    selectionRevision: snapshot.selectionRevision,
+  });
+  if (snapshotState.snapshots.size > 128) {
+    const first = snapshotState.snapshots.keys().next().value;
+    if (first) snapshotState.snapshots.delete(first);
+  }
+  return snapshot;
+}
+
+function nodeForDetail(node, detail) {
+  if (detail === "full") return node;
+  const summaryKeys = new Set([
+    "id", "name", "kind", "parentId", "children", "bounds", "renderBounds",
+    "visible", "locked", "description", "rotation", "transform", "clipsContent",
+    "minWidth", "maxWidth", "minHeight", "maxHeight", "constraints", "layoutAlign",
+    "layoutGrow", "layoutPositioning", "gridPosition", "layout", "hostData",
+  ]);
+  const structureKeys = new Set([
+    ...summaryKeys,
+    "styleRefs", "variableBindings", "component", "accessibility", "annotations",
+    "text", "textSegments", "typography", "prototypeLinks",
+  ]);
+  const keys = detail === "summary" ? summaryKeys : structureKeys;
+  return Object.fromEntries(Object.entries(node).filter(([key]) => keys.has(key)));
 }
 
 function exportStateFor(options) {
@@ -839,7 +957,8 @@ function prototypeLinksFor(node) {
   return links.length ? links : undefined;
 }
 
-function tokenCatalog() {
+function tokenCatalog(options) {
+  if (!options.includeTokens || options.detail === "summary") return [];
   const raw = pluginDataFor(scenegraph.root, "tokens");
   if (!raw) return [];
   let parsed = raw;
@@ -1042,7 +1161,9 @@ async function nodeToIR(node, parentId, topLevel, exportState) {
   const prototypeLinks = prototypeLinksFor(node);
   const styleRefs = styleRefsFor(node);
   const variableBindings = variableBindingsFor(node);
-  const asset = await assetFor(node, exportState);
+  const asset = exportState.options.detail === "full"
+    ? await assetFor(node, exportState)
+    : undefined;
   const description = nonEmptyString(node.description);
   const blendMode = nonEmptyString(node.blendMode);
   const hostData = {
@@ -1053,7 +1174,7 @@ async function nodeToIR(node, parentId, topLevel, exportState) {
     ...(node.isMaster === true ? { isMaster: true } : {}),
     topLevel: Boolean(topLevel),
   };
-  return {
+  return nodeForDetail({
     id,
     name: typeof node.name === "string" ? node.name : nodeType(node),
     kind: nodeKind(node),
@@ -1087,7 +1208,7 @@ async function nodeToIR(node, parentId, topLevel, exportState) {
     ...(typography ? { typography } : {}),
     ...(prototypeLinks ? { prototypeLinks } : {}),
     hostData,
-  };
+  }, exportState.options.detail);
 }
 
 function documentInfo() {
@@ -1108,21 +1229,38 @@ function flattenSubtree(node, parentId, topLevel, entries) {
   childrenOf(node).forEach((child) => flattenSubtree(child, nodeId(node), false, entries));
 }
 
-async function serializeEntries(entries, options) {
-  const selected = entries.slice(options.nodeOffset, options.nodeOffset + options.maxNodes);
+async function serializeEntries(entries, options, snapshot) {
+  const unchanged = options.knownSnapshotId === snapshot.id;
+  const changedIds = options.changedOnly && snapshot.changedNodeIds
+    ? new Set(snapshot.changedNodeIds)
+    : null;
+  const sourceEntries = unchanged
+    ? []
+    : changedIds && changedIds.size
+      ? entries.filter((entry) => changedIds.has(nodeId(entry.node)))
+      : entries;
+  const selected = sourceEntries.slice(options.nodeOffset, options.nodeOffset + options.maxNodes);
   const exportState = exportStateFor(options);
   const nodes = [];
   for (const entry of selected) {
     const node = await nodeToIR(entry.node, entry.parentId, entry.topLevel, exportState);
     if (node) nodes.push(node);
   }
-  const hasMore = options.nodeOffset + nodes.length < entries.length;
+  const hasMore = options.nodeOffset + nodes.length < sourceEntries.length;
+  const partial = !unchanged && (
+    Boolean(options.changedOnly && changedIds && changedIds.size)
+    || options.nodeOffset > 0
+    || hasMore
+    || sourceEntries.length < entries.length
+  );
   return {
     nodes,
+    ...(unchanged ? { unchanged: true } : {}),
+    ...(partial ? { partial: true } : {}),
     pagination: {
       offset: options.nodeOffset,
       limit: options.maxNodes,
-      total: entries.length,
+      total: sourceEntries.length,
       returned: nodes.length,
       hasMore,
       ...(hasMore ? { nextOffset: options.nodeOffset + nodes.length } : {}),
@@ -1142,8 +1280,9 @@ async function buildDocumentIR(options) {
   const root = scenegraph.root;
   const entries = [];
   flattenSubtree(root, null, true, entries);
-  const tokens = options.includeTokens ? tokenCatalog() : [];
-  const serialized = await serializeEntries(entries, options);
+  const snapshot = snapshotFor("document", undefined, options);
+  const serialized = await serializeEntries(entries, options, snapshot);
+  const tokens = serialized.unchanged ? [] : tokenCatalog(options);
   const screens = childrenOf(root)
     .filter((child) => nodeKind(child) === "screen")
     .map((child) => ({ host: "xd", id: nodeId(child) }))
@@ -1161,6 +1300,9 @@ async function buildDocumentIR(options) {
     nodes,
     screens,
     selection: selectionItems().map((item) => ({ host: "xd", id: nodeId(item) })).filter((ref) => ref.id),
+    snapshot,
+    ...(serialized.unchanged ? { unchanged: true } : {}),
+    ...(serialized.partial ? { partial: true } : {}),
     ...(tokens.length ? { tokens } : {}),
     ...(screenDetails.length ? { screenDetails } : {}),
     pagination: serialized.pagination,
@@ -1174,8 +1316,9 @@ async function selectionContext(options) {
   const selection = selectionItems();
   const entries = [];
   selection.forEach((item) => flattenSubtree(item, item.parent ? nodeId(item.parent) : null, item.parent === scenegraph.root, entries));
-  const tokens = options.includeTokens ? tokenCatalog() : [];
-  const serialized = await serializeEntries(entries, options);
+  const snapshot = snapshotFor("selection", undefined, options);
+  const serialized = await serializeEntries(entries, options, snapshot);
+  const tokens = serialized.unchanged ? [] : tokenCatalog(options);
   return {
     schemaVersion: 1,
     scope: "selection",
@@ -1184,6 +1327,9 @@ async function selectionContext(options) {
     documentName: info.documentName,
     selection: selection.map((item) => ({ host: "xd", id: nodeId(item) })).filter((ref) => ref.id),
     nodes: serialized.nodes,
+    snapshot,
+    ...(serialized.unchanged ? { unchanged: true } : {}),
+    ...(serialized.partial ? { partial: true } : {}),
     ...(tokens.length ? { tokens } : {}),
     pagination: serialized.pagination,
     exportStats: { ...serialized.exportStats, tokenCount: tokens.length },
@@ -1216,8 +1362,9 @@ async function screenContext(screenId, options) {
   const info = documentInfo();
   const entries = [];
   flattenSubtree(screen, screen.parent ? nodeId(screen.parent) : null, true, entries);
-  const tokens = options.includeTokens ? tokenCatalog() : [];
-  const serialized = await serializeEntries(entries, options);
+  const snapshot = snapshotFor("screen", nodeId(screen), options);
+  const serialized = await serializeEntries(entries, options, snapshot);
+  const tokens = serialized.unchanged ? [] : tokenCatalog(options);
   const viewport = viewportFor(boundsOf(screen));
   return {
     schemaVersion: 1,
@@ -1227,6 +1374,9 @@ async function screenContext(screenId, options) {
     documentName: info.documentName,
     screenId: nodeId(screen),
     selection: selectionItems().map((item) => ({ host: "xd", id: nodeId(item) })).filter((ref) => ref.id),
+    snapshot,
+    ...(serialized.unchanged ? { unchanged: true } : {}),
+    ...(serialized.partial ? { partial: true } : {}),
     ...(viewport ? { viewport } : {}),
     nodes: serialized.nodes,
     ...(tokens.length ? { tokens } : {}),
@@ -1501,6 +1651,13 @@ function applyNextPending() {
     application.editDocument((selection, documentRoot) => {
       result = executeWrite(item.request.operation, item.request.payload, selection, documentRoot);
     });
+    snapshotState.documentRevision += 1;
+    rememberChangedNodeIds([
+      result && result.node && result.node.id,
+      ...(result && Array.isArray(result.nodes) ? result.nodes.map((node) => node && node.id) : []),
+    ]);
+    assetCache.clear();
+    assetPromises.clear();
     renderPanel();
     sendEvent("write.applied", {
       pendingId: item.pendingId,

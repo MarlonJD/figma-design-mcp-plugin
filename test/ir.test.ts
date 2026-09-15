@@ -6,6 +6,7 @@ import {
   designIRSchema,
   exportOptionsSchema,
   screenSpecSchema,
+  snapshotSchema,
   visualContextSchema,
 } from "../src/core/ir.js";
 
@@ -23,7 +24,17 @@ test("export options are bounded and asset metadata is explicit", () => {
     includeAssets: false,
     maxAssetBytes: 4000000,
     includeTokens: true,
+    detail: "full",
+    changedOnly: false,
   });
+  const incremental = exportOptionsSchema.parse({
+    detail: "structure",
+    knownSnapshotId: "snapshot-1",
+    changedOnly: true,
+  });
+  assert.equal(incremental.detail, "structure");
+  assert.equal(incremental.knownSnapshotId, "snapshot-1");
+  assert.equal(incremental.changedOnly, true);
   assert.throws(() => exportOptionsSchema.parse({ maxNodes: 10001 }));
 
   const asset = designAssetSchema.parse({
@@ -33,6 +44,19 @@ test("export options are bounded and asset metadata is explicit", () => {
     byteSize: 7,
   });
   assert.equal(asset.byteSize, 7);
+
+  const snapshot = snapshotSchema.parse({
+    id: "snapshot-1",
+    scope: "screen",
+    documentRevision: 2,
+    selectionRevision: 1,
+    screenId: "screen-1",
+    changedNodeIds: ["screen-1"],
+    deletedNodeIds: ["old-node"],
+    generatedAt: new Date().toISOString(),
+  });
+  assert.equal(snapshot.scope, "screen");
+  assert.deepEqual(snapshot.deletedNodeIds, ["old-node"]);
 });
 
 test("DesignIR and context IR reject host-specific shape drift", () => {

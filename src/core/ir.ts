@@ -367,12 +367,27 @@ export const exportStatsSchema = z.object({
 });
 export type ExportStats = z.infer<typeof exportStatsSchema>;
 
+export const snapshotSchema = z.object({
+  id: z.string().min(1),
+  scope: z.enum(["document", "selection", "screen"]),
+  documentRevision: z.number().int().nonnegative(),
+  selectionRevision: z.number().int().nonnegative(),
+  screenId: z.string().min(1).optional(),
+  changedNodeIds: z.array(z.string().min(1)).max(2000).optional(),
+  deletedNodeIds: z.array(z.string().min(1)).max(2000).optional(),
+  generatedAt: z.string().datetime({ offset: true }),
+});
+export type Snapshot = z.infer<typeof snapshotSchema>;
+
 export const exportOptionsSchema = z.object({
   maxNodes: z.number().int().positive().max(10000).default(5000),
   nodeOffset: z.number().int().nonnegative().max(1000000).default(0),
   includeAssets: z.boolean().default(true),
   maxAssetBytes: z.number().int().positive().max(50000000).default(4000000),
   includeTokens: z.boolean().default(true),
+  detail: z.enum(["summary", "structure", "full"]).default("full"),
+  knownSnapshotId: z.string().min(1).optional(),
+  changedOnly: z.boolean().default(false),
 });
 export type ExportOptions = z.infer<typeof exportOptionsSchema>;
 
@@ -462,6 +477,9 @@ export const designIRSchema = z.object({
   selection: z.array(nodeRefSchema),
   exportedAt: z.string().datetime({ offset: true }),
   capabilities: hostCapabilitiesSchema.optional(),
+  snapshot: snapshotSchema.optional(),
+  unchanged: z.boolean().optional(),
+  partial: z.boolean().optional(),
   tokens: z.array(designTokenSchema).optional(),
   screenDetails: z.array(screenDetailSchema).optional(),
   pagination: paginationSchema.optional(),
@@ -478,6 +496,9 @@ export const contextIRSchema = z.object({
   selection: z.array(nodeRefSchema),
   nodes: z.array(designNodeSchema),
   screenId: z.string().optional(),
+  snapshot: snapshotSchema.optional(),
+  unchanged: z.boolean().optional(),
+  partial: z.boolean().optional(),
   viewport: viewportSchema.optional(),
   tokens: z.array(designTokenSchema).optional(),
   pagination: paginationSchema.optional(),

@@ -1,5 +1,5 @@
 const BRIDGE_PROTOCOL_VERSION = 1;
-const PLUGIN_VERSION = "0.2.0";
+const PLUGIN_VERSION = "0.3.0";
 
 const CAPABILITIES = {
   host: "figma",
@@ -17,6 +17,7 @@ const CAPABILITIES = {
     "responsive-layout",
     "asset-export",
     "pagination",
+    "incremental-snapshots",
   ],
   operations: [
     "ping",
@@ -44,6 +45,14 @@ const MAX_ASSET_EXPORTS_PER_REQUEST = 64;
 const assetCache = new Map();
 const assetPromises = new Map();
 const tokenCache = new Map();
+const snapshotState = {
+  sessionId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+  documentRevision: 0,
+  selectionRevision: 0,
+  selectionKey: "",
+  changeLog: [],
+  snapshots: new Map(),
+};
 
 const DEFAULT_EXPORT_OPTIONS = {
   maxNodes: 5000,
@@ -51,6 +60,8 @@ const DEFAULT_EXPORT_OPTIONS = {
   includeAssets: true,
   maxAssetBytes: 4000000,
   includeTokens: true,
+  detail: "full",
+  changedOnly: false,
 };
 
 figma.showUI(__html__, { visible: false, width: 1, height: 1 });
@@ -75,7 +86,113 @@ function exportOptionsFor(payload) {
       ? Math.min(50000000, input.maxAssetBytes)
       : DEFAULT_EXPORT_OPTIONS.maxAssetBytes,
     includeTokens: input.includeTokens !== false,
+    detail: input.detail === "summary" || input.detail === "structure" || input.detail === "full"
+      ? input.detail
+      : DEFAULT_EXPORT_OPTIONS.detail,
+    ...(typeof input.knownSnapshotId === "string" && input.knownSnapshotId.trim()
+      ? { knownSnapshotId: input.knownSnapshotId.trim() }
+      : {}),
+    changedOnly: input.changedOnly === true,
   };
+}
+
+function rememberChangedNodeIds(ids, deletedIds) {
+  const normalized = Array.from(new Set(
+    (Array.isArray(ids) ? ids : [ids]).filter((id) => typeof id === "string" && id),
+  ));
+  const deleted = Array.from(new Set(
+    (Array.isArray(deletedIds) ? deletedIds : [deletedIds]).filter((id) => typeof id === "string" && id),
+  ));
+  if (!normalized.length && !deleted.length) return;
+  snapshotState.changeLog.push({
+    documentRevision: snapshotState.documentRevision,
+    selectionRevision: snapshotState.selectionRevision,
+    ids: normalized,
+    deletedIds: deleted,
+  });
+  if (snapshotState.changeLog.length > 256) snapshotState.changeLog.shift();
+}
+
+function syncSelectionRevision() {
+  const key = selectionItems().map((item) => item.id).join(",");
+  if (key === snapshotState.selectionKey) return;
+  snapshotState.selectionKey = key;
+  snapshotState.selectionRevision += 1;
+  rememberChangedNodeIds(selectionItems().map((item) => item.id));
+}
+
+function snapshotFor(scope, screenId, options) {
+  syncSelectionRevision();
+  const info = documentInfo();
+  const optionKey = [
+    options.detail,
+    options.includeAssets,
+    options.maxAssetBytes,
+    options.includeTokens,
+  ].join(":");
+  const id = [
+    snapshotState.sessionId,
+    info.documentId,
+    snapshotState.documentRevision,
+    snapshotState.selectionRevision,
+    scope,
+    screenId || "",
+    optionKey,
+  ].join("|");
+  const known = options.knownSnapshotId
+    ? snapshotState.snapshots.get(options.knownSnapshotId)
+    : undefined;
+  const changedNodeIds = new Set();
+  const deletedNodeIds = new Set();
+  snapshotState.changeLog.forEach((change) => {
+    if (!known
+      || change.documentRevision > known.documentRevision
+      || change.selectionRevision > known.selectionRevision) {
+      change.ids.forEach((nodeId) => changedNodeIds.add(nodeId));
+      change.deletedIds.forEach((nodeId) => deletedNodeIds.add(nodeId));
+    }
+  });
+  deletedNodeIds.forEach((nodeId) => changedNodeIds.delete(nodeId));
+  const snapshot = {
+    id,
+    scope,
+    documentRevision: snapshotState.documentRevision,
+    selectionRevision: snapshotState.selectionRevision,
+    ...(screenId ? { screenId } : {}),
+    ...(changedNodeIds.size
+      ? { changedNodeIds: Array.from(changedNodeIds).slice(-2000) }
+      : {}),
+    ...(deletedNodeIds.size
+      ? { deletedNodeIds: Array.from(deletedNodeIds).slice(-2000) }
+      : {}),
+    generatedAt: new Date().toISOString(),
+  };
+  snapshotState.snapshots.set(id, {
+    documentRevision: snapshot.documentRevision,
+    selectionRevision: snapshot.selectionRevision,
+  });
+  if (snapshotState.snapshots.size > 128) {
+    const first = snapshotState.snapshots.keys().next().value;
+    if (first) snapshotState.snapshots.delete(first);
+  }
+  return snapshot;
+}
+
+function nodeForDetail(node, detail) {
+  if (detail === "full") return node;
+  const summaryKeys = new Set([
+    "id", "name", "kind", "parentId", "children", "bounds", "renderBounds",
+    "visible", "locked", "description", "rotation", "transform", "clipsContent",
+    "minWidth", "maxWidth", "minHeight", "maxHeight", "constraints", "layoutAlign",
+    "layoutGrow", "layoutPositioning", "gridPosition", "layout", "hostData",
+  ]);
+  const structureKeys = new Set([
+    ...summaryKeys,
+    "styleRefs", "variableBindings", "component", "accessibility", "annotations",
+    "text", "textSegments", "typography", "prototypeLinks",
+  ]);
+  const keys = detail === "summary" ? summaryKeys : structureKeys;
+  return Object.fromEntries(Object.entries(node).filter(([key]) => keys.has(key)));
 }
 
 function exportStateFor(options) {
@@ -800,7 +917,7 @@ function styleTokenFor(style, source, type, value) {
 }
 
 async function tokenCatalog(options) {
-  if (!options.includeTokens) return [];
+  if (!options.includeTokens || options.detail === "summary") return [];
   const key = figma.root.id;
   if (tokenCache.has(key)) return tokenCache.get(key);
   const promise = (async () => {
@@ -1173,7 +1290,9 @@ async function nodeToIR(node, parentId, topLevel, exportState) {
   const gridPosition = gridPositionFor(node);
   const prototypeLinks = prototypeLinksFor(node);
   const description = nonEmptyString(node.description);
-  const asset = await assetFor(node, exportState);
+  const asset = exportState.options.detail === "full"
+    ? await assetFor(node, exportState)
+    : undefined;
   const devStatus = safeRead(() => node.devStatus, null);
   const hostData = {
     figmaType: node.type,
@@ -1223,7 +1342,7 @@ async function nodeToIR(node, parentId, topLevel, exportState) {
     ...(prototypeLinks ? { prototypeLinks } : {}),
     hostData,
   };
-  return result;
+  return nodeForDetail(result, exportState.options.detail);
 }
 
 function documentInfo() {
@@ -1247,21 +1366,38 @@ function flattenSubtree(node, parentId, topLevel, entries) {
   ));
 }
 
-async function serializeEntries(entries, options) {
+async function serializeEntries(entries, options, snapshot) {
+  const unchanged = options.knownSnapshotId === snapshot.id;
+  const changedIds = options.changedOnly && snapshot.changedNodeIds
+    ? new Set(snapshot.changedNodeIds)
+    : null;
+  const sourceEntries = unchanged
+    ? []
+    : changedIds && changedIds.size
+      ? entries.filter((entry) => changedIds.has(entry.node.id))
+      : entries;
   const start = options.nodeOffset;
-  const selected = entries.slice(start, start + options.maxNodes);
+  const selected = sourceEntries.slice(start, start + options.maxNodes);
   const exportState = exportStateFor(options);
   const nodes = [];
   for (const entry of selected) {
     nodes.push(await nodeToIR(entry.node, entry.parentId, entry.topLevel, exportState));
   }
-  const hasMore = start + nodes.length < entries.length;
+  const hasMore = start + nodes.length < sourceEntries.length;
+  const partial = !unchanged && (
+    Boolean(options.changedOnly && changedIds && changedIds.size)
+    || start > 0
+    || hasMore
+    || sourceEntries.length < entries.length
+  );
   return {
     nodes,
+    ...(unchanged ? { unchanged: true } : {}),
+    ...(partial ? { partial: true } : {}),
     pagination: {
       offset: start,
       limit: options.maxNodes,
-      total: entries.length,
+      total: sourceEntries.length,
       returned: nodes.length,
       hasMore,
       ...(hasMore ? { nextOffset: start + nodes.length } : {}),
@@ -1281,8 +1417,9 @@ async function buildDocumentIR(options) {
   const page = figma.currentPage;
   const entries = [];
   flattenSubtree(page, null, true, entries);
-  const tokens = await tokenCatalog(options);
-  const serialized = await serializeEntries(entries, options);
+  const snapshot = snapshotFor("document", undefined, options);
+  const serialized = await serializeEntries(entries, options, snapshot);
+  const tokens = serialized.unchanged ? [] : await tokenCatalog(options);
   const screenDetails = screenDetailsFor(page);
   const nodes = {};
   serialized.nodes.forEach((node) => {
@@ -1301,6 +1438,9 @@ async function buildDocumentIR(options) {
     nodes,
     screens,
     selection: selectionItems().map((item) => ref(item.id)),
+    snapshot,
+    ...(serialized.unchanged ? { unchanged: true } : {}),
+    ...(serialized.partial ? { partial: true } : {}),
     ...(tokens.length ? { tokens } : {}),
     ...(screenDetails.length ? { screenDetails } : {}),
     pagination: serialized.pagination,
@@ -1314,8 +1454,9 @@ async function selectionContext(options) {
   const selection = selectionItems();
   const entries = [];
   selection.forEach((item) => flattenSubtree(item, item.parent && item.parent.id, item.parent === figma.currentPage, entries));
-  const tokens = await tokenCatalog(options);
-  const serialized = await serializeEntries(entries, options);
+  const snapshot = snapshotFor("selection", undefined, options);
+  const serialized = await serializeEntries(entries, options, snapshot);
+  const tokens = serialized.unchanged ? [] : await tokenCatalog(options);
   return {
     schemaVersion: 1,
     scope: "selection",
@@ -1324,6 +1465,9 @@ async function selectionContext(options) {
     documentName: info.documentName,
     selection: selection.map((item) => ref(item.id)),
     nodes: serialized.nodes,
+    snapshot,
+    ...(serialized.unchanged ? { unchanged: true } : {}),
+    ...(serialized.partial ? { partial: true } : {}),
     ...(tokens.length ? { tokens } : {}),
     pagination: serialized.pagination,
     exportStats: { ...serialized.exportStats, tokenCount: tokens.length },
@@ -1346,8 +1490,9 @@ async function screenContext(screenId, options) {
   const info = documentInfo();
   const entries = [];
   flattenSubtree(screen, screen.parent && screen.parent.id, true, entries);
-  const tokens = await tokenCatalog(options);
-  const serialized = await serializeEntries(entries, options);
+  const snapshot = snapshotFor("screen", screen.id, options);
+  const serialized = await serializeEntries(entries, options, snapshot);
+  const tokens = serialized.unchanged ? [] : await tokenCatalog(options);
   const selection = selectionItems();
   const viewport = viewportFor(boundsFor(screen));
   return {
@@ -1358,6 +1503,9 @@ async function screenContext(screenId, options) {
     documentName: info.documentName,
     screenId: screen.id,
     selection: selection.map((item) => ref(item.id)),
+    snapshot,
+    ...(serialized.unchanged ? { unchanged: true } : {}),
+    ...(serialized.partial ? { partial: true } : {}),
     ...(viewport ? { viewport } : {}),
     nodes: serialized.nodes,
     ...(tokens.length ? { tokens } : {}),
@@ -1589,7 +1737,15 @@ figma.on("selectionchange", () => {
     });
 });
 
-figma.on("documentchange", () => {
+figma.on("documentchange", (event) => {
+  snapshotState.documentRevision += 1;
+  const changes = event && Array.isArray(event.documentChanges) ? event.documentChanges : [];
+  changes.forEach((change) => {
+    const id = change && (change.id || change.node && change.node.id);
+    const type = typeof (change && change.type) === "string" ? change.type.toUpperCase() : "";
+    rememberChangedNodeIds(type === "DELETE" || type === "DELETED" || type === "REMOVED" ? [] : [id],
+      type === "DELETE" || type === "DELETED" || type === "REMOVED" ? [id] : []);
+  });
   assetCache.clear();
   assetPromises.clear();
   tokenCache.clear();

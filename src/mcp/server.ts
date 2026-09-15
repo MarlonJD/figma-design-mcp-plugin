@@ -12,6 +12,8 @@ import {
 import { asDesignPortError, DesignPortError } from "../core/errors.js";
 import { DesignPortBridge } from "../bridge/bridge-server.js";
 import { BridgeHostAdapter } from "../core/adapter.js";
+import { auditDesignContext, designAuditSchema } from "../core/audit.js";
+import { buildDesignGraph, designGraphSchema } from "../core/graph.js";
 
 const hostInput = z.object({
   host: hostKindSchema.optional(),
@@ -51,6 +53,13 @@ const visualInput = hostInput.extend({
 });
 
 const designContextInput = visualInput.extend({
+  ...exportOptionsSchema.shape,
+  includeAudit: z.boolean().default(true),
+});
+
+const exportContextInput = hostInput.extend({
+  scope: z.enum(["document", "selection", "screen"]).default("screen"),
+  screenId: z.string().min(1).optional(),
   ...exportOptionsSchema.shape,
 });
 
@@ -139,7 +148,7 @@ async function callBridge<T>(
 export function createMcpServer(bridge: DesignPortBridge): McpServer {
   const server = new McpServer({
     name: "designport",
-    version: "0.2.0",
+    version: "0.3.0",
   });
 
   server.registerTool(
@@ -177,7 +186,7 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
     "design.get_selection_context",
     {
       title: "Read selection context",
-      description: "Return the current host selection normalized as DesignIR nodes with optional pagination, token, and asset controls.",
+      description: "Return the current selection as DesignIR with summary, structure, or full detail and optional pagination, delta, token, and asset controls.",
       inputSchema: selectionContextInput.shape,
     },
     async ({ host, ...options }) =>
@@ -190,7 +199,7 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
     "design.get_screen_context",
     {
       title: "Read screen context",
-      description: "Return one screen/artboard and its normalized descendants with optional pagination, token, and asset controls.",
+      description: "Return one screen/artboard as DesignIR with summary, structure, or full detail and optional pagination, delta, token, and asset controls.",
       inputSchema: screenContextInput.shape,
     },
     async ({ host, screenId, ...options }) =>
@@ -221,7 +230,7 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
     "design.export_ir",
     {
       title: "Export DesignIR",
-      description: "Export the document, current selection, or one screen as DesignIR with optional pagination, token, and asset controls.",
+      description: "Export the document, current selection, or one screen as DesignIR with detail modes, pagination, snapshot reuse, changed-only deltas, token, and asset controls.",
       inputSchema: exportInput.shape,
     },
     async ({ host, scope, screenId, ...options }) =>
@@ -233,23 +242,82 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
   );
 
   server.registerTool(
+    "design.audit_context",
+    {
+      title: "Audit design context",
+      description: "Report deterministic semantic, responsive, interaction, accessibility, and token issues in an exported design context.",
+      inputSchema: exportContextInput.shape,
+    },
+    async ({ host, scope, screenId, ...options }) => {
+      try {
+        const adapter = new BridgeHostAdapter(bridge, resolveHost(bridge, host));
+        const snapshot = await adapter.exportIR(
+          scope,
+          screenId,
+          exportOptionsSchema.parse({
+            ...options,
+            includeAssets: false,
+            knownSnapshotId: undefined,
+            changedOnly: false,
+          }),
+        );
+        return jsonResult(designAuditSchema.parse(auditDesignContext(snapshot)));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "design.get_graph",
+    {
+      title: "Read design component and interaction graph",
+      description: "Return component/instance relationships, variant state values, screen viewports, and prototype interaction edges from a design context.",
+      inputSchema: exportContextInput.shape,
+    },
+    async ({ host, scope, screenId, ...options }) => {
+      try {
+        const adapter = new BridgeHostAdapter(bridge, resolveHost(bridge, host));
+        const snapshot = await adapter.exportIR(
+          scope,
+          screenId,
+          exportOptionsSchema.parse({
+            ...options,
+            detail: options.detail === "full" ? "structure" : options.detail,
+            includeAssets: false,
+            knownSnapshotId: undefined,
+            changedOnly: false,
+          }),
+        );
+        return jsonResult(designGraphSchema.parse(buildDesignGraph(snapshot)));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
     "design.get_design_context",
     {
       title: "Read complete design context",
-      description: "Return host-neutral DesignIR properties, local image/vector assets, and a PNG visual reference together so an agent can reconstruct the interface in its own stack. Large snapshots can be paginated and assets/tokens can be limited.",
+      description: "Return host-neutral DesignIR properties, deterministic audit evidence, local image/vector assets, and a PNG visual reference together so an agent can reconstruct the interface in its own stack. Large snapshots can be paginated and assets/tokens can be limited.",
       inputSchema: designContextInput.shape,
     },
-    async ({ host, scope, screenId, ...options }) => {
+    async ({ host, scope, screenId, includeAudit, ...options }) => {
       try {
         const adapter = new BridgeHostAdapter(bridge, resolveHost(bridge, host));
         const normalizedOptions = exportOptionsSchema.parse(options);
         const snapshot = await adapter.exportIR(scope, screenId, normalizedOptions);
         const visual = await adapter.getVisualContext(scope, screenId);
+        const audit = includeAudit && snapshot.unchanged !== true
+          ? designAuditSchema.parse(auditDesignContext(snapshot))
+          : undefined;
         const content = [
           {
             type: "text" as const,
             text: JSON.stringify({
               properties: snapshot,
+              ...(audit ? { audit } : {}),
               visual: {
                 scope: visual.scope,
                 host: visual.host,

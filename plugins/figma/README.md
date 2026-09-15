@@ -36,7 +36,10 @@ The export also includes local variables/styles as `tokens`, node style and
 variable bindings, mixed text style ranges, component properties and variant
 state values, accessibility/annotation metadata, and interaction details. A
 request can set `maxNodes`, `nodeOffset`, `includeAssets`, `maxAssetBytes`, and
-`includeTokens`; the response reports `pagination` and `exportStats`.
+`includeTokens`, plus `detail` (`summary`, `structure`, or `full`). The
+response reports `pagination`, `exportStats`, and a session-stable `snapshot`.
+Reuse `knownSnapshotId` to receive `unchanged: true`, or set `changedOnly` to
+receive the observed changed nodes for a cache merge.
 
 Asset data is embedded only for visible vector and image-painted nodes. If a
 host export fails, the structural node remains available and the missing

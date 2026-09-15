@@ -60,6 +60,14 @@ integration.
   annotations, and accessibility signals when the host provides them.
 - Paginate large documents and cap embedded asset bytes so an agent can request
   context in deliberate chunks.
+- Return session-stable snapshot/revision metadata so an agent can reuse a
+  known snapshot or request only observed changes.
+- Offer `summary`, `structure`, and `full` context detail modes for deliberate
+  context budgeting.
+- Run deterministic semantic audits for layout, accessibility, interaction,
+  component, and token evidence.
+- Expose a component/instance and prototype-interaction graph alongside the
+  node-level IR.
 - Report connected hosts, capabilities, and recent host events.
 - Create screens and basic components through host adapters.
 - Apply a normalized patch to the current selection.
@@ -78,6 +86,8 @@ The available MCP tools are:
 | `design.get_screen_context` | Read one screen/artboard and its descendants. |
 | `design.get_visual_context` | Render a selection or screen as PNG image content. |
 | `design.export_ir` | Export document, selection, or screen context. |
+| `design.audit_context` | Check exported context for deterministic semantic issues. |
+| `design.get_graph` | Read reusable-component and prototype-interaction relationships. |
 | `design.get_design_context` | Return DesignIR properties and the visual PNG together. |
 | `design.create_screen` | Create an artboard/screen. |
 | `design.create_component` | Create a basic component or symbol where supported. |
@@ -91,7 +101,7 @@ layout interpretation guide.
 ### What the MCP gives the agent
 
 `design.get_design_context` is the normal implementation entry point. Its
-response contains two complementary evidence layers:
+response contains three complementary evidence layers:
 
 1. `properties`: the scoped `DesignIR` data — hierarchy, host-neutral node
    kinds, bounds and render bounds, fills, typography, assets, effects, corner
@@ -100,6 +110,9 @@ response contains two complementary evidence layers:
    links.
 2. A PNG image content block: the visual truth of the selected screen or
    component.
+3. `audit`: deterministic diagnostics for semantic, accessibility, interaction,
+   component, and token gaps (included by default; disable with
+   `includeAudit: false`).
 
 The MCP server supplies evidence; the LLM decides component boundaries,
 behavior, accessibility, and the correct primitives for the destination
@@ -130,9 +143,20 @@ what it looks like. Neither layer is treated as an instruction supplied by
 the design file.
 
 For large screens, pass `maxNodes`, `nodeOffset`, `includeAssets`,
-`maxAssetBytes`, and `includeTokens` to the context/export tools. The response
-contains `pagination` and `exportStats`, so a harness can request the next page
-without guessing whether a node or asset was omitted.
+`maxAssetBytes`, `includeTokens`, and `detail` (`summary`, `structure`, or
+`full`) to the context/export tools. The response contains `pagination`,
+`exportStats`, and a `snapshot` object. A harness can request a smaller detail
+mode first, then request the next page without guessing whether a node or asset
+was omitted.
+
+To avoid sending a complete context on every loop, reuse the exact
+`snapshot.id` with `knownSnapshotId`. If the document and selection revisions
+are unchanged, the response has `unchanged: true` and no nodes. After a change,
+set `changedOnly: true` with the previous snapshot ID to receive only the
+observed changed nodes; such a response is marked `partial: true` and should be
+merged into the harness cache by node ID. Remove IDs listed in
+`snapshot.deletedNodeIds`. Snapshot IDs include the export shape, so keep the
+detail and asset/token options consistent when reusing one.
 
 ## Requirements
 
@@ -250,8 +274,18 @@ npm run visual:compare -- reference.png candidate.png
 ```
 
 The command reports similarity, mean pixel error, changed-pixel ratio, and the
-smallest bounding box containing the difference. It returns a non-zero exit
-code when the configured visual thresholds fail.
+smallest bounding box containing the difference. It can also emit a red
+heatmap, a reference/candidate overlay, and a grid of regional metrics:
+
+```bash
+npm run visual:compare -- reference.png candidate.png \
+  --regions=8x8 \
+  --heatmap-output=artifacts/diff-heatmap.png \
+  --overlay-output=artifacts/diff-overlay.png \
+  --json
+```
+
+It returns a non-zero exit code when the configured visual thresholds fail.
 
 Use `design.get_selection_context`, `design.get_screen_context`, and
 `design.get_visual_context` separately when you want a smaller response or a
@@ -278,7 +312,7 @@ git diff --check
 The project layout is intentionally simple:
 
 ```text
-src/core/       DesignIR and protocol contracts
+src/core/       DesignIR, audits, graph, and protocol contracts
 src/bridge/     Local WebSocket host bridge
 src/mcp/        MCP tool registration
 src/eval/       Deterministic PNG visual comparison

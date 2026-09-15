@@ -75,6 +75,67 @@ If `properties.pagination.hasMore` is `true`, call the same tool with
 `properties.exportStats` to see how many assets and tokens were actually
 returned.
 
+For a fast first pass, request only the structural evidence:
+
+```json
+{
+  "tool": "design.get_design_context",
+  "arguments": {
+    "host": "figma",
+    "scope": "screen",
+    "screenId": "SCREEN_ID_FROM_CONTEXT",
+    "detail": "structure",
+    "includeAssets": false
+  }
+}
+```
+
+The three detail modes are `summary` (hierarchy, bounds, and layout signals),
+`structure` (those signals plus component, token, accessibility, text-range,
+and interaction evidence), and `full` (visual styling and embedded assets).
+
+## Reuse a snapshot and request only changes
+
+Save the returned `properties.snapshot.id` in the harness cache. To check the
+same export without receiving all nodes again:
+
+```json
+{
+  "tool": "design.export_ir",
+  "arguments": {
+    "host": "figma",
+    "scope": "screen",
+    "screenId": "SCREEN_ID_FROM_CONTEXT",
+    "detail": "structure",
+    "includeAssets": false,
+    "knownSnapshotId": "SNAPSHOT_ID_FROM_CACHE"
+  }
+}
+```
+
+When the revision is unchanged, the response contains `unchanged: true` and
+an empty node collection. After the design changes, use the same snapshot as a
+baseline and request a delta:
+
+```json
+{
+  "tool": "design.export_ir",
+  "arguments": {
+    "host": "figma",
+    "scope": "screen",
+    "screenId": "SCREEN_ID_FROM_CONTEXT",
+    "detail": "structure",
+    "includeAssets": false,
+    "knownSnapshotId": "SNAPSHOT_ID_FROM_CACHE",
+    "changedOnly": true
+  }
+}
+```
+
+Merge `nodes` by ID and remove any IDs in `properties.snapshot.deletedNodeIds`.
+A changed-only or paginated response is marked `partial: true`; it does not
+replace the complete cached context.
+
 ## Read a selection
 
 Use a selection for a component or a small group:
@@ -117,6 +178,40 @@ messages or cache the normalized snapshot:
 ```
 
 The same operation supports `scope: "selection"` and `scope: "document"`.
+
+## Audit and graph the design before implementation
+
+Run a deterministic audit over a screen or document:
+
+```json
+{
+  "tool": "design.audit_context",
+  "arguments": {
+    "host": "figma",
+    "scope": "screen",
+    "screenId": "SCREEN_ID_FROM_CONTEXT",
+    "detail": "full"
+  }
+}
+```
+
+The result includes a summary and diagnostics for issues such as an unlabeled
+interactive node, an absolute child inside a flow, or an unresolved token.
+If the context is paginated, treat the audit as partial.
+
+For a compact implementation plan, read the reusable-component and navigation
+graph:
+
+```json
+{
+  "tool": "design.get_graph",
+  "arguments": {
+    "host": "figma",
+    "scope": "document",
+    "detail": "structure"
+  }
+}
+```
 
 ## Recognize semantic layout
 
@@ -187,12 +282,21 @@ For a repeatable local gate, save the host PNG as `reference.png`, render the
 implementation at the same viewport as `properties.viewport`, and run:
 
 ```bash
-npm run visual:compare -- reference.png candidate.png --json
+npm run visual:compare -- reference.png candidate.png --regions=8x8 --json
 ```
 
 The evaluator composites transparent pixels over white, checks dimensions first,
-and reports `changedBounds` so the agent can focus its next iteration. The
-default thresholds are intentionally small but not exact-pixel strict; tune
+and reports `changedBounds` plus per-region similarity and changed-pixel ratios
+so the agent can focus its next iteration. To inspect the mismatch visually,
+also write a heatmap and overlay:
+
+```bash
+npm run visual:compare -- reference.png candidate.png \
+  --heatmap-output=artifacts/diff-heatmap.png \
+  --overlay-output=artifacts/diff-overlay.png
+```
+
+The default thresholds are intentionally small but not exact-pixel strict; tune
 them for anti-aliasing and font-rendering differences with
 `--pixel-threshold`, `--max-mae`, and `--max-changed`.
 

@@ -24,9 +24,17 @@ permanent panel.
 ## Capabilities
 
 The plugin can report capabilities, read selections and screens, render PNG
-visual context, export the shared IR, create basic screens/components, and
-apply supported selection patches. Figma writes are applied immediately by
-the plugin.
+visual context, and export the shared IR. The Figma adapter preserves the
+signals an agent needs to reconstruct a responsive interface: paint stacks
+and gradients, image/vector assets, typography, corner radii, effects,
+constraints, auto-layout/grid metadata, absolute positioning, and prototype
+links when the document exposes them. It can also create basic
+screens/components and apply supported selection patches. Figma writes are
+applied immediately by the plugin.
+
+Asset data is embedded only for visible vector and image-painted nodes. If a
+host export fails, the structural node remains available and the missing
+asset is not replaced with a guessed shape.
 
 For the full setup, tool list, and examples, see the repository
 [README](../../README.md) and [EXAMPLES.md](../../EXAMPLES.md).

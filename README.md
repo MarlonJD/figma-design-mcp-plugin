@@ -6,12 +6,12 @@ with designs in Figma and Adobe XD.
 It gives an agent both the visual reference and the structured design context
 needed to implement a screen. A designer can keep working in the tool they
 know, while an agent can read selections and screens, render them as PNG
-context, export a host-neutral design model, and generate a starting point for
-web, React, Vue, Flutter, SwiftUI, or Jetpack Compose.
+context, and export a host-neutral design model that it can adapt to the
+application stack already present in the target repository.
 
 DesignPort is an early, local-first project. It is intentionally small enough
 to run on a designer's computer and clear enough to extend with more hosts and
-code-generation targets.
+agent harnesses.
 
 ## Why does this exist?
 
@@ -25,7 +25,7 @@ DesignPort separates the problem into three parts:
 1. A Figma or XD development plugin reads and renders the open document.
 2. The local bridge normalizes the document into `DesignIR`, a shared design
    representation, and carries PNG previews when requested.
-3. MCP tools make properties, visual context, generated code, and carefully
+3. MCP tools make properties, visual context, and carefully
    scoped design operations available to coding agents.
 
 The result is a common path from design to implementation:
@@ -37,12 +37,12 @@ Figma / Adobe XD
         v
 DesignPort bridge + MCP server
         |
-        | properties + visual + generated code
+        | DesignIR properties + visual reference
         v
 Codex / Claude / another MCP client
         |
         v
-HTML / React / Vue / Flutter / SwiftUI / Compose
+The repository's own UI stack
 ```
 
 The shared model is the important part. Figma-specific and XD-specific details
@@ -56,11 +56,9 @@ integration.
 - Render the current selection or a screen/artboard as PNG visual context.
 - Export a full document or a scoped `DesignIR` snapshot.
 - Report connected hosts, capabilities, and recent host events.
-- Generate a web export, a self-contained HTML export, or starter code for
-  React, Vue, Flutter, SwiftUI, and Jetpack Compose.
 - Create screens and basic components through host adapters.
 - Apply a normalized patch to the current selection.
-- Return properties, visual context, and target code together for agent review.
+- Return properties and visual context together for agent review.
 - Keep the bridge on loopback (`127.0.0.1`) by default.
 
 The available MCP tools are:
@@ -74,8 +72,7 @@ The available MCP tools are:
 | `design.get_screen_context` | Read one screen/artboard and its descendants. |
 | `design.get_visual_context` | Render a selection or screen as PNG image content. |
 | `design.export_ir` | Export document, selection, or screen context. |
-| `design.generate_code` | Generate web, HTML, React, Vue, Flutter, SwiftUI, or Compose code. |
-| `design.get_design_context` | Return properties, visual PNG, and generated code together. |
+| `design.get_design_context` | Return DesignIR properties and the visual PNG together. |
 | `design.create_screen` | Create an artboard/screen. |
 | `design.create_component` | Create a basic component or symbol where supported. |
 | `design.update_selection` | Apply a normalized patch to the current selection. |
@@ -87,58 +84,34 @@ workflows.
 ### What the MCP gives the agent
 
 `design.get_design_context` is the normal implementation entry point. Its
-response contains three complementary layers:
+response contains two complementary evidence layers:
 
-1. `properties`: the scoped `DesignIR` data — hierarchy, node kinds, bounds,
-   fills, typography, and layout metadata.
+1. `properties`: the scoped `DesignIR` data — hierarchy, host-neutral node
+   kinds, bounds and render bounds, fills, typography, assets, effects, corner
+   radii, constraints, layout metadata, and prototype links.
 2. A PNG image content block: the visual truth of the selected screen or
    component.
-3. The requested target code as one text block per generated file.
 
-The MCP server does not replace the reasoning model. DesignPort supplies
-evidence; the LLM decides component boundaries, behavior, accessibility, and
-whether a layout should be a row, column, grid, or stack. The deterministic
-generator provides a consistent semantic first pass so the model does not
-have to reconstruct basic flex behavior from pixels alone.
+The MCP server supplies evidence; the LLM decides component boundaries,
+behavior, accessibility, and the correct primitives for the destination
+stack. DesignPort intentionally does not emit framework code. This keeps
+React, Vue, HTML, Flutter, SwiftUI, Compose, and future stacks under the
+target repository's own conventions and current dependency versions.
 
-### Code generation targets
+### DesignIR contract
 
-| Target | Files returned | Intended use |
-| --- | --- | --- |
-| `web` | `index.html`, `styles.css` | A normal two-file browser export. |
-| `html` | `designport-export.html` | A self-contained browser preview. |
-| `react` | `DesignPortScreen.tsx`, `DesignPortScreen.css` | React application starter. |
-| `vue` | `DesignPortScreen.vue` | Vue single-file component starter. |
-| `flutter` | `design_port_screen.dart` | Flutter core-widget starter with no design-system package dependency. |
-| `swiftui` | `DesignPortScreen.swift` | SwiftUI view starter. |
-| `compose` | `DesignPortScreen.kt` | Jetpack Compose composable starter. |
+`DesignIR` is the source of truth for agent harnesses. Coordinates are retained
+for visual comparison and genuinely free-form placement, while explicit
+layout metadata describes the intended structure: horizontal/vertical/grid
+flow, gap, padding, fixed/hug/fill sizing, alignment, wrapping, absolute
+positioning, constraints, and grid placement. Figma vector and image assets
+are carried as local data when the host can export them, so an agent does not
+have to redraw icons or substitute screenshots.
 
-Every target is generated from the same `DesignIR` snapshot. The mobile and
-UI-framework outputs preserve geometry, colors, typography, and hierarchy as a
-semantic first pass; application behavior, assets, and final accessibility
-still need to be wired in the destination project.
-
-### Semantic layout generation
-
-Code generation is not a screenshot-to-pixels conversion. The generator uses
-the host's explicit layout metadata first, including direction, gap, padding,
-and fixed/hug/fill sizing. If a host does not expose that metadata, it makes a
-conservative sibling-layout inference. Coordinates are retained only as the
-fallback for genuinely free-form or ambiguous placement.
-
-The same layout plan maps to the native primitive for each target:
-
-| Design intent | Web / React / Vue | Flutter | SwiftUI | Compose |
-| --- | --- | --- | --- | --- |
-| Horizontal flow | CSS `flex-direction: row` | `Row` | `HStack` | `Row` |
-| Vertical flow | CSS `flex-direction: column` | `Column` | `VStack` | `Column` |
-| Fill remaining space | `flex: 1 1 0` | `Expanded` | `frame(maxWidth/maxHeight: .infinity)` | `weight(1f)` |
-| Grid-like flow | CSS grid | `Wrap` | `LazyVGrid` | rows of weighted `Row`s |
-
-Current native UI baselines are intentionally modern: Flutter uses the SDK's
-style-neutral `widgets.dart` library with semantic flex primitives, SwiftUI
-emits iOS 26+/macOS 26+ Liquid Glass APIs with a fallback, and Compose uses the
-latest stable Material 3 dependency with dynamic color and `Scaffold`.
+The visual PNG remains mandatory evidence. An agent should use the two layers
+together: the IR explains what the design is made of, and the image verifies
+what it looks like. Neither layer is treated as an instruction supplied by
+the design file.
 
 ## Requirements
 
@@ -242,22 +215,16 @@ must be applied from the panel inside a user-initiated edit context.
 
 With the bridge and one plugin connected, ask the MCP client to:
 
-1. Call `design.get_design_context` with `target: "react"` for the selected
-   screen/artboard.
+1. Call `design.get_design_context` for the selected screen/artboard.
 2. Compare the returned PNG with `properties.nodes` and its layout metadata.
-3. Ask the LLM to replace pixel-only placement with semantic primitives where
-   the structure supports it, such as flex, `Row`/`Column`, `HStack`/`VStack`,
-   or Compose `Row`/`Column`.
-4. Use the generated output as a starting point, then refine behavior and
-   accessibility in application code.
+3. Ask the LLM to identify reusable components, responsive structure, states,
+   interactions, and accessibility requirements.
+4. Have the agent implement the result using the target repository's existing
+   components and current framework conventions.
 
 Use `design.get_selection_context`, `design.get_screen_context`, and
-`design.generate_code` separately when you want smaller responses or a
-different stage of the workflow.
-
-The generator is deliberately a starter generator. It preserves useful layout
-semantics, geometry, fills, typography, and hierarchy, but it is not a promise
-of production-ready UI code. See the target-specific examples in
+`design.get_visual_context` separately when you want a smaller response or a
+different stage of the workflow. See the agent-harness examples in
 [EXAMPLES.md](EXAMPLES.md).
 
 ## Development
@@ -283,10 +250,9 @@ The project layout is intentionally simple:
 src/core/       DesignIR and protocol contracts
 src/bridge/     Local WebSocket host bridge
 src/mcp/        MCP tool registration
-src/codegen/    Web and cross-platform code generation
 plugins/figma/  Figma development plugin
 plugins/xd/     Adobe XD UXP development plugin
-test/           Protocol, IR, bridge, and generator tests
+test/           Protocol, IR, and bridge tests
 ```
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before changing the protocol or adding

@@ -45,11 +45,33 @@ export const colorSchema = z.object({
 });
 export type Color = z.infer<typeof colorSchema>;
 
+export const affineTransformSchema = z.object({
+  a: z.number().finite(),
+  b: z.number().finite(),
+  c: z.number().finite(),
+  d: z.number().finite(),
+  tx: z.number().finite(),
+  ty: z.number().finite(),
+});
+export type AffineTransform = z.infer<typeof affineTransformSchema>;
+
 export const fillSchema = z.object({
   type: z.enum(["solid", "gradient", "image", "unknown"]),
   color: colorSchema.optional(),
   opacity: z.number().min(0).max(1).optional(),
+  visible: z.boolean().optional(),
+  blendMode: z.string().min(1).optional(),
   resource: z.string().optional(),
+  gradientType: z.enum(["linear", "radial", "angular", "diamond"]).optional(),
+  gradientStops: z.array(z.object({
+    position: z.number().min(0).max(1),
+    color: colorSchema,
+  })).optional(),
+  gradientTransform: affineTransformSchema.optional(),
+  imageScaleMode: z.enum(["fill", "fit", "crop", "tile"]).optional(),
+  imageTransform: affineTransformSchema.optional(),
+  imageScaleFactor: z.number().finite().positive().optional(),
+  imageRotation: z.number().finite().optional(),
 });
 export type Fill = z.infer<typeof fillSchema>;
 
@@ -57,8 +79,36 @@ export const strokeSchema = z.object({
   fills: z.array(fillSchema),
   weight: z.number().finite().nonnegative().optional(),
   position: z.enum(["inside", "outside", "center"]).optional(),
+  sideWeights: z.object({
+    top: z.number().finite().nonnegative(),
+    right: z.number().finite().nonnegative(),
+    bottom: z.number().finite().nonnegative(),
+    left: z.number().finite().nonnegative(),
+  }).optional(),
+  dashPattern: z.array(z.number().finite().nonnegative()).optional(),
+  cap: z.string().min(1).optional(),
+  join: z.string().min(1).optional(),
 });
 export type Stroke = z.infer<typeof strokeSchema>;
+
+export const effectSchema = z.object({
+  type: z.enum(["drop-shadow", "inner-shadow", "layer-blur", "background-blur", "unknown"]),
+  color: colorSchema.optional(),
+  offset: pointSchema.optional(),
+  radius: z.number().finite().nonnegative().optional(),
+  spread: z.number().finite().optional(),
+  visible: z.boolean().optional(),
+  blendMode: z.string().min(1).optional(),
+});
+export type Effect = z.infer<typeof effectSchema>;
+
+export const designAssetSchema = z.object({
+  mimeType: z.string().min(1),
+  data: z.string().min(1),
+  kind: z.enum(["image", "vector"]).optional(),
+  imageScaleMode: z.enum(["fill", "fit", "crop", "tile"]).optional(),
+});
+export type DesignAsset = z.infer<typeof designAssetSchema>;
 
 export const visualItemSchema = z.object({
   nodeId: z.string().min(1),
@@ -89,12 +139,20 @@ export const typographySchema = z.object({
   lineHeight: z.number().finite().positive().optional(),
   letterSpacing: z.number().finite().optional(),
   align: z.enum(["left", "center", "right", "justified"]).optional(),
+  alignVertical: z.enum(["top", "center", "bottom"]).optional(),
+  decoration: z.enum(["none", "underline", "strikethrough"]).optional(),
+  textCase: z.enum(["original", "upper", "lower", "title", "small-caps", "small-caps-forced"]).optional(),
+  autoResize: z.enum(["none", "width-and-height", "height", "truncate"]).optional(),
+  textTruncation: z.enum(["disabled", "ending"]).optional(),
+  maxLines: z.number().int().positive().optional(),
+  paragraphIndent: z.number().finite().optional(),
+  paragraphSpacing: z.number().finite().nonnegative().optional(),
 });
 export type Typography = z.infer<typeof typographySchema>;
 
 export const layoutSchema = z.object({
   mode: z.enum(["none", "horizontal", "vertical", "grid"]),
-  gap: z.number().finite().nonnegative().optional(),
+  gap: z.number().finite().optional(),
   padding: z
     .object({
       top: z.number().finite().nonnegative(),
@@ -105,14 +163,37 @@ export const layoutSchema = z.object({
     .optional(),
   sizingHorizontal: z.enum(["fixed", "hug", "fill"]).optional(),
   sizingVertical: z.enum(["fixed", "hug", "fill"]).optional(),
+  primaryAxisAlign: z.enum(["min", "center", "max", "space-between"]).optional(),
+  counterAxisAlign: z.enum(["min", "center", "max", "baseline"]).optional(),
+  counterAxisAlignContent: z.enum(["auto", "space-between"]).optional(),
+  wrap: z.enum(["no-wrap", "wrap"]).optional(),
+  counterAxisSpacing: z.number().finite().nonnegative().optional(),
+  itemReverseZIndex: z.boolean().optional(),
+  strokesIncludedInLayout: z.boolean().optional(),
+  grid: z.object({
+    rows: z.number().int().positive().optional(),
+    columns: z.number().int().positive().optional(),
+    rowGap: z.number().finite().nonnegative().optional(),
+    columnGap: z.number().finite().nonnegative().optional(),
+  }).optional(),
 });
 export type Layout = z.infer<typeof layoutSchema>;
+
+export const constraintsSchema = z.object({
+  horizontal: z.enum(["left", "right", "center", "left-right", "scale"]).optional(),
+  vertical: z.enum(["top", "bottom", "center", "top-bottom", "scale"]).optional(),
+});
+export type Constraints = z.infer<typeof constraintsSchema>;
 
 export const prototypeLinkSchema = z.object({
   trigger: z.string(),
   action: z.string(),
   destinationId: z.string().optional(),
+  url: z.string().optional(),
+  navigation: z.string().min(1).optional(),
   transition: z.string().optional(),
+  duration: z.number().finite().nonnegative().optional(),
+  preserveScrollPosition: z.boolean().optional(),
 });
 export type PrototypeLink = z.infer<typeof prototypeLinkSchema>;
 
@@ -131,11 +212,38 @@ export const designNodeSchema = z.object({
   parentId: z.string().nullable(),
   children: z.array(z.string()),
   bounds: boundsSchema.nullable(),
+  renderBounds: boundsSchema.nullable().optional(),
   visible: z.boolean(),
   locked: z.boolean().optional(),
   opacity: z.number().min(0).max(1).optional(),
+  blendMode: z.string().min(1).optional(),
   fills: z.array(fillSchema).optional(),
   strokes: z.array(strokeSchema).optional(),
+  effects: z.array(effectSchema).optional(),
+  cornerRadius: z.number().finite().nonnegative().optional(),
+  cornerRadii: z.object({
+    topLeft: z.number().finite().nonnegative(),
+    topRight: z.number().finite().nonnegative(),
+    bottomRight: z.number().finite().nonnegative(),
+    bottomLeft: z.number().finite().nonnegative(),
+  }).optional(),
+  asset: designAssetSchema.optional(),
+  rotation: z.number().finite().optional(),
+  clipsContent: z.boolean().optional(),
+  minWidth: z.number().finite().nonnegative().optional(),
+  maxWidth: z.number().finite().nonnegative().optional(),
+  minHeight: z.number().finite().nonnegative().optional(),
+  maxHeight: z.number().finite().nonnegative().optional(),
+  constraints: constraintsSchema.optional(),
+  layoutAlign: z.enum(["min", "center", "max", "stretch", "inherit"]).optional(),
+  layoutGrow: z.number().finite().nonnegative().optional(),
+  layoutPositioning: z.enum(["auto", "absolute"]).optional(),
+  gridPosition: z.object({
+    row: z.number().int().nonnegative().optional(),
+    column: z.number().int().nonnegative().optional(),
+    rowSpan: z.number().int().positive().optional(),
+    columnSpan: z.number().int().positive().optional(),
+  }).optional(),
   text: z.string().optional(),
   typography: typographySchema.optional(),
   layout: layoutSchema.optional(),

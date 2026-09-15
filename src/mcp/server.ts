@@ -11,7 +11,6 @@ import {
 import { asDesignPortError, DesignPortError } from "../core/errors.js";
 import { DesignPortBridge } from "../bridge/bridge-server.js";
 import { BridgeHostAdapter } from "../core/adapter.js";
-import { generateCode } from "../codegen/generate.js";
 
 const hostInput = z.object({
   host: hostKindSchema.optional(),
@@ -39,18 +38,9 @@ const exportInput = hostInput.extend({
   screenId: z.string().min(1).optional(),
 });
 
-const generateCodeInput = exportInput.extend({
-  target: z.enum(["html", "web", "react", "vue", "flutter", "swiftui", "compose"]).default("web"),
-});
-
 const visualInput = hostInput.extend({
   scope: z.enum(["selection", "screen"]).default("screen"),
   screenId: z.string().min(1).optional(),
-});
-
-const designContextInput = visualInput.extend({
-  target: z.enum(["html", "web", "react", "vue", "flutter", "swiftui", "compose"]).default("web"),
-  includeVisual: z.boolean().default(true),
 });
 
 function jsonResult(value: unknown) {
@@ -223,68 +213,33 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
   );
 
   server.registerTool(
-    "design.generate_code",
-    {
-      title: "Generate application code",
-      description: "Export DesignIR from a host and generate a semantic starter implementation for web, React, Vue, Flutter core widgets, SwiftUI, or Jetpack Compose. Layout metadata maps to flex, Row/Column, stacks, and fill-sized children where possible.",
-      inputSchema: generateCodeInput.shape,
-    },
-    async ({ host, scope, screenId, target }) => {
-      try {
-        const adapter = new BridgeHostAdapter(bridge, resolveHost(bridge, host));
-        const snapshot = await adapter.exportIR(scope, screenId);
-        return jsonResult(generateCode(snapshot, target));
-      } catch (error) {
-        return errorResult(error);
-      }
-    },
-  );
-
-  server.registerTool(
     "design.get_design_context",
     {
       title: "Read complete design context",
-      description: "Return design properties, a visual PNG, and generated target code together so an agent can reason from structure, appearance, and implementation.",
-      inputSchema: designContextInput.shape,
+      description: "Return host-neutral DesignIR properties, local image/vector assets, and a PNG visual reference together so an agent can reconstruct the interface in its own stack.",
+      inputSchema: visualInput.shape,
     },
-    async ({ host, scope, screenId, target, includeVisual }) => {
+    async ({ host, scope, screenId }) => {
       try {
         const adapter = new BridgeHostAdapter(bridge, resolveHost(bridge, host));
         const snapshot = await adapter.exportIR(scope, screenId);
-        const generated = generateCode(snapshot, target);
-        const visual = includeVisual
-          ? await adapter.getVisualContext(scope, screenId)
-          : undefined;
+        const visual = await adapter.getVisualContext(scope, screenId);
         const content = [
           {
             type: "text" as const,
             text: JSON.stringify({
               properties: snapshot,
-              visual: visual
-                ? {
-                    scope: visual.scope,
-                    host: visual.host,
-                    items: visual.items.map(({ data: _data, ...item }) => item),
-                  }
-                : null,
-              code: {
-                target: generated.target,
-                files: Object.keys(generated.files),
-                nodeCount: generated.nodeCount,
-                screenCount: generated.screenCount,
+              visual: {
+                scope: visual.scope,
+                host: visual.host,
+                items: visual.items.map(({ data: _data, ...item }) => item),
               },
             }, null, 2),
           },
-          ...(visual
-            ? visual.items.map((item) => ({
-                type: "image" as const,
-                data: item.data,
-                mimeType: item.mimeType,
-              }))
-            : []),
-          ...Object.entries(generated.files).map(([name, source]) => ({
-            type: "text" as const,
-            text: `// ${name}\n${source}`,
+          ...visual.items.map((item) => ({
+            type: "image" as const,
+            data: item.data,
+            mimeType: item.mimeType,
           })),
         ];
         return { content };

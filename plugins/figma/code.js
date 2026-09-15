@@ -26,10 +26,37 @@ const CAPABILITIES = {
   },
 };
 
+const MAX_ASSET_EXPORTS_PER_REQUEST = 64;
+const assetCache = new Map();
+const assetPromises = new Map();
+
 figma.showUI(__html__, { visible: false, width: 1, height: 1 });
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, Number(value) || 0));
+}
+
+function affineTransformFor(value) {
+  if (!Array.isArray(value) || value.length !== 2) return undefined;
+  if (!Array.isArray(value[0]) || !Array.isArray(value[1]) || value[0].length !== 3 || value[1].length !== 3) {
+    return undefined;
+  }
+  const values = [...value[0], ...value[1]];
+  if (!values.every((item) => Number.isFinite(item))) return undefined;
+  return {
+    a: value[0][0],
+    b: value[1][0],
+    c: value[0][1],
+    d: value[1][1],
+    tx: value[0][2],
+    ty: value[1][2],
+  };
+}
+
+function blendModeFor(value) {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.toLowerCase();
+  return normalized === "normal" || normalized === "pass_through" ? undefined : normalized;
 }
 
 function ref(id) {
@@ -70,34 +97,194 @@ function boundsFor(node) {
 function paintsToIR(paints) {
   if (!Array.isArray(paints)) return [];
   return paints.map((paint) => {
-    if (paint.type !== "SOLID" || !paint.color) {
-      return { type: "unknown", opacity: Number.isFinite(paint.opacity) ? clamp(paint.opacity, 0, 1) : 1 };
-    }
-    return {
-      type: "solid",
-      color: {
-        r: clamp(paint.color.r, 0, 1),
-        g: clamp(paint.color.g, 0, 1),
-        b: clamp(paint.color.b, 0, 1),
-        ...(Number.isFinite(paint.opacity) ? { a: clamp(paint.opacity, 0, 1) } : {}),
-      },
-      opacity: Number.isFinite(paint.opacity) ? clamp(paint.opacity, 0, 1) : 1,
+    const opacity = Number.isFinite(paint.opacity) ? clamp(paint.opacity, 0, 1) : 1;
+    const common = {
+      ...(opacity !== 1 ? { opacity } : {}),
+      ...(paint.visible === false ? { visible: false } : {}),
+      ...(blendModeFor(paint.blendMode) ? { blendMode: blendModeFor(paint.blendMode) } : {}),
     };
+    if (paint.type === "SOLID" && paint.color) {
+      return {
+        type: "solid",
+        color: {
+          r: clamp(paint.color.r, 0, 1),
+          g: clamp(paint.color.g, 0, 1),
+          b: clamp(paint.color.b, 0, 1),
+        },
+        ...common,
+      };
+    }
+    if (paint.type === "IMAGE") {
+      return {
+        type: "image",
+        ...(paint.imageHash ? { resource: paint.imageHash } : {}),
+        ...(typeof paint.scaleMode === "string" ? { imageScaleMode: paint.scaleMode.toLowerCase() } : {}),
+        ...(affineTransformFor(paint.imageTransform) ? { imageTransform: affineTransformFor(paint.imageTransform) } : {}),
+        ...(Number.isFinite(paint.scalingFactor) && paint.scalingFactor > 0 ? { imageScaleFactor: paint.scalingFactor } : {}),
+        ...(Number.isFinite(paint.rotation) ? { imageRotation: paint.rotation } : {}),
+        ...common,
+      };
+    }
+    if (typeof paint.type === "string" && paint.type.startsWith("GRADIENT_") && Array.isArray(paint.gradientStops)) {
+      const gradientType = {
+        GRADIENT_LINEAR: "linear",
+        GRADIENT_RADIAL: "radial",
+        GRADIENT_ANGULAR: "angular",
+        GRADIENT_DIAMOND: "diamond",
+      }[paint.type];
+      return {
+        type: "gradient",
+        ...(gradientType ? { gradientType } : {}),
+        gradientStops: paint.gradientStops.map((stop) => ({
+          position: clamp(stop.position, 0, 1),
+          color: {
+            r: clamp(stop.color.r, 0, 1),
+            g: clamp(stop.color.g, 0, 1),
+            b: clamp(stop.color.b, 0, 1),
+            ...(Number.isFinite(stop.color.a) ? { a: clamp(stop.color.a, 0, 1) } : {}),
+          },
+        })),
+        ...(affineTransformFor(paint.gradientTransform) ? { gradientTransform: affineTransformFor(paint.gradientTransform) } : {}),
+        ...common,
+      };
+    }
+    return { type: "unknown", ...common };
   });
 }
 
 function strokesToIR(node) {
-  if (!Array.isArray(node.strokes)) return undefined;
+  if (!Array.isArray(node.strokes) || !node.strokes.length) return undefined;
   const position = {
     INSIDE: "inside",
     OUTSIDE: "outside",
     CENTER: "center",
   }[node.strokeAlign];
+  const sideWeights = {
+    top: node.strokeTopWeight,
+    right: node.strokeRightWeight,
+    bottom: node.strokeBottomWeight,
+    left: node.strokeLeftWeight,
+  };
+  const hasSideWeights = Object.values(sideWeights).every((value) => Number.isFinite(value));
   return paintsToIR(node.strokes).map((fill) => ({
     fills: [fill],
     ...(Number.isFinite(node.strokeWeight) ? { weight: Math.max(0, node.strokeWeight) } : {}),
     ...(position ? { position } : {}),
+    ...(hasSideWeights ? {
+      sideWeights: Object.fromEntries(
+        Object.entries(sideWeights).map(([key, value]) => [key, Math.max(0, value)]),
+      ),
+    } : {}),
+    ...(Array.isArray(node.dashPattern) ? {
+      dashPattern: node.dashPattern
+        .filter((value) => Number.isFinite(value))
+        .map((value) => Math.max(0, value)),
+    } : {}),
+    ...(typeof node.strokeCap === "string" ? { cap: node.strokeCap.toLowerCase() } : {}),
+    ...(typeof node.strokeJoin === "string" ? { join: node.strokeJoin.toLowerCase() } : {}),
   }));
+}
+
+function effectsToIR(node) {
+  if (!Array.isArray(node.effects) || !node.effects.length) return undefined;
+  return node.effects.map((effect) => {
+    const type = {
+      DROP_SHADOW: "drop-shadow",
+      INNER_SHADOW: "inner-shadow",
+      LAYER_BLUR: "layer-blur",
+      BACKGROUND_BLUR: "background-blur",
+    }[effect.type] || "unknown";
+    return {
+      type,
+      ...(effect.color ? {
+        color: {
+          r: clamp(effect.color.r, 0, 1),
+          g: clamp(effect.color.g, 0, 1),
+          b: clamp(effect.color.b, 0, 1),
+          ...(Number.isFinite(effect.color.a) ? { a: clamp(effect.color.a, 0, 1) } : {}),
+        },
+      } : {}),
+      ...(effect.offset ? {
+        offset: {
+          x: Number(effect.offset.x) || 0,
+          y: Number(effect.offset.y) || 0,
+        },
+      } : {}),
+      ...(Number.isFinite(effect.radius) ? { radius: Math.max(0, effect.radius) } : {}),
+      ...(Number.isFinite(effect.spread) ? { spread: effect.spread } : {}),
+      ...(typeof effect.visible === "boolean" ? { visible: effect.visible } : {}),
+      ...(blendModeFor(effect.blendMode) ? { blendMode: blendModeFor(effect.blendMode) } : {}),
+    };
+  });
+}
+
+function cornersToIR(node) {
+  const result = {};
+  if (typeof node.cornerRadius === "number" && Number.isFinite(node.cornerRadius) && node.cornerRadius > 0) {
+    result.cornerRadius = Math.max(0, node.cornerRadius);
+  }
+  const corners = {
+    topLeft: node.topLeftRadius,
+    topRight: node.topRightRadius,
+    bottomRight: node.bottomRightRadius,
+    bottomLeft: node.bottomLeftRadius,
+  };
+  if (Object.values(corners).every((value) => Number.isFinite(value)) && Object.values(corners).some((value) => value > 0)) {
+    result.cornerRadii = Object.fromEntries(
+      Object.entries(corners).map(([key, value]) => [key, Math.max(0, value)]),
+    );
+  }
+  return result;
+}
+
+function assetCacheKey(node) {
+  return `${figma.root.id}:${node.id}`;
+}
+
+async function assetFor(node, exportState) {
+  if (node.visible === false) return undefined;
+  const isVector = node.type === "VECTOR" || node.type === "BOOLEAN_OPERATION" || node.type === "POLYGON" || node.type === "STAR";
+  const imagePaint = Array.isArray(node.fills)
+    ? node.fills.find((paint) => paint && paint.type === "IMAGE" && paint.imageHash)
+    : undefined;
+  if (!isVector && !imagePaint) return undefined;
+
+  const key = assetCacheKey(node);
+  if (assetCache.has(key)) return assetCache.get(key);
+  const pending = assetPromises.get(key);
+  if (pending) return pending;
+  if (exportState.assetExports >= MAX_ASSET_EXPORTS_PER_REQUEST) return undefined;
+  exportState.assetExports += 1;
+
+  const promise = (async () => {
+    try {
+      if (isVector) {
+        const svg = await node.exportAsync({ format: "SVG_STRING", contentsOnly: true });
+        if (typeof svg === "string" && svg.trim()) {
+          return { mimeType: "image/svg+xml", data: svg, kind: "vector" };
+        }
+      }
+      if (!imagePaint) return undefined;
+      const bytes = await node.exportAsync({ format: "PNG", contentsOnly: true });
+      return {
+        mimeType: "image/png",
+        data: figma.base64Encode(bytes),
+        kind: "image",
+        ...(typeof imagePaint.scaleMode === "string" ? { imageScaleMode: imagePaint.scaleMode.toLowerCase() } : {}),
+      };
+    } catch (_error) {
+      // Keep the structural node when a host cannot export one asset.
+      return undefined;
+    }
+  })();
+  assetPromises.set(key, promise);
+  try {
+    const asset = await promise;
+    assetCache.set(key, asset);
+    return asset;
+  } finally {
+    assetPromises.delete(key);
+  }
 }
 
 function typographyFor(node) {
@@ -108,16 +295,70 @@ function typographyFor(node) {
     if (typeof node.fontName.style === "string") result.style = node.fontName.style;
   }
   if (typeof node.fontSize === "number") result.size = node.fontSize;
+  if (typeof node.fontWeight === "number") result.weight = node.fontWeight;
   if (typeof node.letterSpacing === "object" && typeof node.letterSpacing.value === "number") {
-    result.letterSpacing = node.letterSpacing.value;
+    result.letterSpacing = node.letterSpacing.unit === "PERCENT" && typeof node.fontSize === "number"
+      ? node.fontSize * node.letterSpacing.value / 100
+      : node.letterSpacing.value;
   }
+  if (typeof node.lineHeight === "object" && typeof node.lineHeight.value === "number") {
+    result.lineHeight = node.lineHeight.unit === "PERCENT" && typeof node.fontSize === "number"
+      ? node.fontSize * node.lineHeight.value / 100
+      : node.lineHeight.value;
+  }
+  if (typeof node.textDecoration === "string") {
+    const decoration = {
+      NONE: "none",
+      UNDERLINE: "underline",
+      STRIKETHROUGH: "strikethrough",
+    }[node.textDecoration];
+    if (decoration) result.decoration = decoration;
+  }
+  if (typeof node.textCase === "string") {
+    const textCase = {
+      ORIGINAL: "original",
+      UPPER: "upper",
+      LOWER: "lower",
+      TITLE: "title",
+      SMALL_CAPS: "small-caps",
+      SMALL_CAPS_FORCED: "small-caps-forced",
+    }[node.textCase];
+    if (textCase) result.textCase = textCase;
+  }
+  if (typeof node.textAlignVertical === "string") {
+    const alignVertical = {
+      TOP: "top",
+      CENTER: "center",
+      BOTTOM: "bottom",
+    }[node.textAlignVertical];
+    if (alignVertical) result.alignVertical = alignVertical;
+  }
+  if (typeof node.textAutoResize === "string") {
+    const autoResize = {
+      NONE: "none",
+      WIDTH_AND_HEIGHT: "width-and-height",
+      HEIGHT: "height",
+      TRUNCATE: "truncate",
+    }[node.textAutoResize];
+    if (autoResize) result.autoResize = autoResize;
+  }
+  if (typeof node.textTruncation === "string") {
+    const textTruncation = {
+      DISABLED: "disabled",
+      ENDING: "ending",
+    }[node.textTruncation];
+    if (textTruncation) result.textTruncation = textTruncation;
+  }
+  if (Number.isInteger(node.maxLines) && node.maxLines > 0) result.maxLines = node.maxLines;
+  if (Number.isFinite(node.paragraphIndent)) result.paragraphIndent = node.paragraphIndent;
+  if (Number.isFinite(node.paragraphSpacing)) result.paragraphSpacing = Math.max(0, node.paragraphSpacing);
   if (typeof node.textAlignHorizontal === "string") {
     result.align = node.textAlignHorizontal.toLowerCase();
   }
   return Object.keys(result).length ? result : undefined;
 }
 
-function layoutFor(node) {
+function layoutFor(node, parentLayoutMode) {
   const sizing = (value) => {
     if (value === "FIXED" || value === "HUG" || value === "FILL") {
       return value.toLowerCase();
@@ -129,41 +370,222 @@ function layoutFor(node) {
     : "none";
   const sizingHorizontal = sizing(node.layoutSizingHorizontal);
   const sizingVertical = sizing(node.layoutSizingVertical);
-  if (mode === "none" && !sizingHorizontal && !sizingVertical) return undefined;
+  const primaryAxisAlign = {
+    MIN: "min",
+    CENTER: "center",
+    MAX: "max",
+    SPACE_BETWEEN: "space-between",
+  }[node.primaryAxisAlignItems];
+  const counterAxisAlign = {
+    MIN: "min",
+    CENTER: "center",
+    MAX: "max",
+    BASELINE: "baseline",
+  }[node.counterAxisAlignItems];
+  const counterAxisAlignContent = {
+    AUTO: "auto",
+    SPACE_BETWEEN: "space-between",
+  }[node.counterAxisAlignContent];
+  const wrap = {
+    NO_WRAP: "no-wrap",
+    WRAP: "wrap",
+  }[node.layoutWrap];
+  const grid = {};
+  if (mode === "grid") {
+    if (Number.isInteger(node.gridRowCount) && node.gridRowCount > 0) grid.rows = node.gridRowCount;
+    if (Number.isInteger(node.gridColumnCount) && node.gridColumnCount > 0) grid.columns = node.gridColumnCount;
+    if (Number.isFinite(node.gridRowGap) && node.gridRowGap > 0) grid.rowGap = node.gridRowGap;
+    if (Number.isFinite(node.gridColumnGap) && node.gridColumnGap > 0) grid.columnGap = node.gridColumnGap;
+  }
+  const hasGridMetadata = mode === "grid" && Object.keys(grid).length > 0;
+  const parentUsesLayout = parentLayoutMode === "HORIZONTAL"
+    || parentLayoutMode === "VERTICAL"
+    || parentLayoutMode === "GRID";
+  const padding = {
+    top: Number(node.paddingTop) || 0,
+    right: Number(node.paddingRight) || 0,
+    bottom: Number(node.paddingBottom) || 0,
+    left: Number(node.paddingLeft) || 0,
+  };
+  const hasPadding = Object.values(padding).some((value) => value > 0);
+  const hasLayoutMetadata = mode !== "none"
+    || parentUsesLayout && (
+      sizingHorizontal
+      || sizingVertical
+      || primaryAxisAlign
+      || counterAxisAlign
+      || node.layoutPositioning === "ABSOLUTE"
+    )
+    || counterAxisAlignContent === "space-between"
+    || wrap === "wrap"
+    || Number.isFinite(node.counterAxisSpacing) && node.counterAxisSpacing > 0
+    || node.itemReverseZIndex === true
+    || node.strokesIncludedInLayout === true
+    || hasGridMetadata;
+  if (!hasLayoutMetadata) return undefined;
   return {
     mode,
-    ...(typeof node.itemSpacing === "number" ? { gap: node.itemSpacing } : {}),
-    padding: {
-      top: Number(node.paddingTop) || 0,
-      right: Number(node.paddingRight) || 0,
-      bottom: Number(node.paddingBottom) || 0,
-      left: Number(node.paddingLeft) || 0,
-    },
+    ...(typeof node.itemSpacing === "number" && node.itemSpacing !== 0 ? { gap: node.itemSpacing } : {}),
+    ...(hasPadding ? { padding } : {}),
     ...(sizingHorizontal ? { sizingHorizontal } : {}),
     ...(sizingVertical ? { sizingVertical } : {}),
+    ...(primaryAxisAlign ? { primaryAxisAlign } : {}),
+    ...(counterAxisAlign ? { counterAxisAlign } : {}),
+    ...(counterAxisAlignContent === "space-between" ? { counterAxisAlignContent } : {}),
+    ...(wrap === "wrap" ? { wrap } : {}),
+    ...(Number.isFinite(node.counterAxisSpacing) && node.counterAxisSpacing > 0 ? { counterAxisSpacing: node.counterAxisSpacing } : {}),
+    ...(node.itemReverseZIndex === true ? { itemReverseZIndex: true } : {}),
+    ...(node.strokesIncludedInLayout === true ? { strokesIncludedInLayout: true } : {}),
+    ...(hasGridMetadata ? { grid } : {}),
   };
+}
+
+function constraintsFor(node) {
+  if (!node.constraints) return undefined;
+  const horizontal = {
+    LEFT: "left",
+    RIGHT: "right",
+    CENTER: "center",
+    LEFT_RIGHT: "left-right",
+    SCALE: "scale",
+  }[node.constraints.horizontal];
+  const vertical = {
+    TOP: "top",
+    BOTTOM: "bottom",
+    CENTER: "center",
+    TOP_BOTTOM: "top-bottom",
+    SCALE: "scale",
+  }[node.constraints.vertical];
+  if (!horizontal && !vertical) return undefined;
+  return {
+    ...(horizontal ? { horizontal } : {}),
+    ...(vertical ? { vertical } : {}),
+  };
+}
+
+function prototypeLinksFor(node) {
+  if (!Array.isArray(node.reactions) || !node.reactions.length) return undefined;
+  const links = [];
+  node.reactions.forEach((reaction) => {
+    const trigger = reaction.trigger && reaction.trigger.type
+      ? String(reaction.trigger.type).toLowerCase()
+      : "unknown";
+    const actions = Array.isArray(reaction.actions)
+      ? reaction.actions
+      : reaction.action
+        ? [reaction.action]
+        : [];
+    actions.forEach((action) => {
+      if (!action || typeof action.type !== "string") return;
+      links.push({
+        trigger,
+        action: action.type.toLowerCase(),
+        ...(typeof action.destinationId === "string" ? { destinationId: action.destinationId } : {}),
+        ...(typeof action.url === "string" ? { url: action.url } : {}),
+        ...(typeof action.navigation === "string" ? { navigation: action.navigation.toLowerCase() } : {}),
+        ...(action.transition && typeof action.transition.type === "string"
+          ? { transition: action.transition.type.toLowerCase() }
+          : {}),
+        ...(action.transition && Number.isFinite(action.transition.duration)
+          ? { duration: Math.max(0, action.transition.duration) }
+          : {}),
+        ...(typeof action.preserveScrollPosition === "boolean"
+          ? { preserveScrollPosition: action.preserveScrollPosition }
+          : {}),
+      });
+    });
+  });
+  return links.length ? links : undefined;
 }
 
 function childrenOf(node) {
   return Array.isArray(node.children) ? node.children : [];
 }
 
-function nodeToIR(node, parentId, topLevel) {
+function gridPositionFor(node) {
+  const position = {};
+  if (Number.isInteger(node.gridRowAnchorIndex) && node.gridRowAnchorIndex >= 0) {
+    position.row = node.gridRowAnchorIndex;
+  }
+  if (Number.isInteger(node.gridColumnAnchorIndex) && node.gridColumnAnchorIndex >= 0) {
+    position.column = node.gridColumnAnchorIndex;
+  }
+  if (Number.isInteger(node.gridRowSpan) && node.gridRowSpan > 0) position.rowSpan = node.gridRowSpan;
+  if (Number.isInteger(node.gridColumnSpan) && node.gridColumnSpan > 0) position.columnSpan = node.gridColumnSpan;
+  return position.row !== undefined || position.column !== undefined ? position : undefined;
+}
+
+function renderBoundsFor(node, layoutBounds) {
+  const rawBounds = node.absoluteRenderBounds;
+  if (!rawBounds) return undefined;
+  const renderBounds = {
+    x: Number(rawBounds.x) || 0,
+    y: Number(rawBounds.y) || 0,
+    width: Math.max(0, Number(rawBounds.width) || 0),
+    height: Math.max(0, Number(rawBounds.height) || 0),
+  };
+  if (
+    layoutBounds &&
+    renderBounds.x === layoutBounds.x &&
+    renderBounds.y === layoutBounds.y &&
+    renderBounds.width === layoutBounds.width &&
+    renderBounds.height === layoutBounds.height
+  ) {
+    return undefined;
+  }
+  return renderBounds;
+}
+
+async function nodeToIR(node, parentId, topLevel, exportState) {
   const children = childrenOf(node);
+  const corners = cornersToIR(node);
+  const bounds = boundsFor(node);
+  const renderBounds = renderBoundsFor(node, bounds);
+  const fills = Array.isArray(node.fills) && node.fills.length ? paintsToIR(node.fills) : undefined;
+  const strokes = strokesToIR(node);
+  const opacity = Number.isFinite(node.opacity) && node.opacity !== 1
+    ? clamp(node.opacity, 0, 1)
+    : undefined;
+  const rotation = Number.isFinite(node.rotation) && node.rotation !== 0 ? node.rotation : undefined;
+  const clipsContent = node.clipsContent === true ? true : undefined;
+  const layoutAlign = typeof node.layoutAlign === "string" && node.layoutAlign !== "INHERIT"
+    ? node.layoutAlign.toLowerCase()
+    : undefined;
+  const layoutGrow = Number.isFinite(node.layoutGrow) && node.layoutGrow > 0
+    ? node.layoutGrow
+    : undefined;
+  const layoutPositioning = node.layoutPositioning === "ABSOLUTE" ? "absolute" : undefined;
   const result = {
     id: node.id,
     name: node.name || node.type,
     kind: kindFor(node, topLevel),
     parentId: parentId || null,
     children: children.map((child) => child.id),
-    bounds: boundsFor(node),
+    bounds,
+    ...(renderBounds ? { renderBounds } : {}),
     visible: node.visible !== false,
-    opacity: Number.isFinite(node.opacity) ? clamp(node.opacity, 0, 1) : undefined,
-    fills: Array.isArray(node.fills) ? paintsToIR(node.fills) : undefined,
-    strokes: strokesToIR(node),
+    ...(opacity !== undefined ? { opacity } : {}),
+    ...(blendModeFor(node.blendMode) ? { blendMode: blendModeFor(node.blendMode) } : {}),
+    ...(fills ? { fills } : {}),
+    ...(strokes ? { strokes } : {}),
+    effects: effectsToIR(node),
+    ...corners,
+    asset: await assetFor(node, exportState),
+    ...(rotation !== undefined ? { rotation } : {}),
+    ...(clipsContent ? { clipsContent } : {}),
+    minWidth: Number.isFinite(node.minWidth) ? Math.max(0, node.minWidth) : undefined,
+    maxWidth: Number.isFinite(node.maxWidth) ? Math.max(0, node.maxWidth) : undefined,
+    minHeight: Number.isFinite(node.minHeight) ? Math.max(0, node.minHeight) : undefined,
+    maxHeight: Number.isFinite(node.maxHeight) ? Math.max(0, node.maxHeight) : undefined,
+    constraints: constraintsFor(node),
+    ...(layoutAlign ? { layoutAlign } : {}),
+    ...(layoutGrow !== undefined ? { layoutGrow } : {}),
+    ...(layoutPositioning ? { layoutPositioning } : {}),
+    gridPosition: gridPositionFor(node),
     text: node.type === "TEXT" ? node.characters : undefined,
     typography: typographyFor(node),
-    layout: layoutFor(node),
+    layout: layoutFor(node, node.parent && node.parent.layoutMode),
+    prototypeLinks: prototypeLinksFor(node),
     hostData: {
       figmaType: node.type,
       topLevel: Boolean(topLevel),
@@ -183,17 +605,14 @@ function selectionItems() {
   return figma.currentPage.selection || [];
 }
 
-function buildDocumentIR() {
+async function buildDocumentIR() {
   const page = figma.currentPage;
   const nodes = {};
-
-  function visit(node, parentId, topLevel) {
-    const converted = nodeToIR(node, parentId, topLevel);
-    nodes[converted.result.id] = converted.result;
-    converted.children.forEach((child) => visit(child, converted.result.id, false));
-  }
-
-  visit(page, null, true);
+  const exportState = { assetExports: 0 };
+  const flattened = await collectSubtree(page, null, true, exportState);
+  flattened.forEach((node) => {
+    nodes[node.id] = node;
+  });
   const info = documentInfo();
   const screens = page.children
     .filter((child) => child.type === "FRAME")
@@ -211,23 +630,29 @@ function buildDocumentIR() {
   };
 }
 
-function addSubtree(node, parentId, result, topLevel) {
-  const converted = nodeToIR(node, parentId, topLevel);
-  result.push(converted.result);
-  converted.children.forEach((child) => addSubtree(child, converted.result.id, result, false));
+async function collectSubtree(node, parentId, topLevel, exportState) {
+  const converted = await nodeToIR(node, parentId, topLevel, exportState);
+  const childNodes = await Promise.all(
+    converted.children.map((child) => collectSubtree(child, converted.result.id, false, exportState)),
+  );
+  return [converted.result, ...childNodes.flat()];
 }
 
-function selectionContext() {
+async function selectionContext() {
   const info = documentInfo();
-  const nodes = [];
-  selectionItems().forEach((item) => addSubtree(item, item.parent && item.parent.id, nodes, item.parent === figma.currentPage));
+  const selection = selectionItems();
+  const exportState = { assetExports: 0 };
+  const nodeLists = await Promise.all(
+    selection.map((item) => collectSubtree(item, item.parent && item.parent.id, item.parent === figma.currentPage, exportState)),
+  );
+  const nodes = nodeLists.flat();
   return {
     schemaVersion: 1,
     scope: "selection",
     host: "figma",
     documentId: info.documentId,
     documentName: info.documentName,
-    selection: selectionItems().map((item) => ref(item.id)),
+    selection: selection.map((item) => ref(item.id)),
     nodes,
     exportedAt: new Date().toISOString(),
   };
@@ -242,12 +667,13 @@ function findScreen(screenId) {
   return selected || figma.currentPage.children.find((child) => child.type === "FRAME") || null;
 }
 
-function screenContext(screenId) {
+async function screenContext(screenId) {
   const screen = findScreen(screenId);
   if (!screen) throw new Error("No Figma screen frame was found for the requested screen");
   const info = documentInfo();
-  const nodes = [];
-  addSubtree(screen, screen.parent && screen.parent.id, nodes, true);
+  const exportState = { assetExports: 0 };
+  const nodes = await collectSubtree(screen, screen.parent && screen.parent.id, true, exportState);
+  const selection = selectionItems();
   return {
     schemaVersion: 1,
     scope: "screen",
@@ -255,7 +681,7 @@ function screenContext(screenId) {
     documentId: info.documentId,
     documentName: info.documentName,
     screenId: screen.id,
-    selection: selectionItems().map((item) => ref(item.id)),
+    selection: selection.map((item) => ref(item.id)),
     nodes,
     exportedAt: new Date().toISOString(),
   };
@@ -410,10 +836,10 @@ async function handleRequest(request) {
         result = CAPABILITIES;
         break;
       case "get_selection_context":
-        result = selectionContext();
+        result = await selectionContext();
         break;
       case "get_screen_context":
-        result = screenContext(request.payload && request.payload.screenId);
+        result = await screenContext(request.payload && request.payload.screenId);
         break;
       case "get_visual_context":
         result = await visualContext(
@@ -424,10 +850,10 @@ async function handleRequest(request) {
       case "export_ir": {
         const scope = (request.payload && request.payload.scope) || "document";
         result = scope === "selection"
-          ? selectionContext()
+          ? await selectionContext()
           : scope === "screen"
-            ? screenContext(request.payload && request.payload.screenId)
-            : buildDocumentIR();
+            ? await screenContext(request.payload && request.payload.screenId)
+            : await buildDocumentIR();
         break;
       }
       case "create_screen":
@@ -455,8 +881,26 @@ figma.ui.onmessage = (message) => {
 };
 
 figma.on("selectionchange", () => {
-  sendToUI({
-    type: "bridge_event",
-    value: { type: "event", event: "selection.changed", payload: selectionContext() },
-  });
+  void selectionContext()
+    .then((payload) => {
+      sendToUI({
+        type: "bridge_event",
+        value: { type: "event", event: "selection.changed", payload },
+      });
+    })
+    .catch((error) => {
+      sendToUI({
+        type: "bridge_event",
+        value: {
+          type: "event",
+          event: "status",
+          payload: { status: "error", message: error && error.message ? error.message : String(error) },
+        },
+      });
+    });
+});
+
+figma.on("documentchange", () => {
+  assetCache.clear();
+  assetPromises.clear();
 });

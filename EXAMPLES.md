@@ -1,18 +1,10 @@
-# DesignPort examples
+# DesignPort agent-harness examples
 
-These examples assume that:
-
-1. Dependencies are installed with `npm install`.
-2. The bridge is running with `npm start`, or is being launched by the MCP
-   client.
-3. A Figma or Adobe XD development plugin is connected.
-
-The snippets below show MCP tool names and JSON arguments. The exact UI for
-calling a tool depends on the MCP client.
+These examples assume that the bridge is running and that a Figma or Adobe XD
+development plugin is connected. DesignPort returns evidence; the agent uses
+that evidence to implement the screen in the target repository.
 
 ## Discover the connected host
-
-Start with:
 
 ```json
 {
@@ -21,13 +13,46 @@ Start with:
 }
 ```
 
-If both Figma and XD are open, pass `host` explicitly in every subsequent
-call. This avoids accidentally reading or changing the wrong document.
+If Figma and XD are open at the same time, pass `host` explicitly in every
+subsequent call.
 
-The response includes each host's session, document name, capabilities, and
-supported operations.
+## Read one complete screen
 
-## Read the current selection
+This is the normal design-to-implementation call. It returns a scoped
+`DesignIR` plus a PNG image block in one MCP response:
+
+```json
+{
+  "tool": "design.get_design_context",
+  "arguments": {
+    "host": "figma",
+    "scope": "screen",
+    "screenId": "SCREEN_ID_FROM_CONTEXT"
+  }
+}
+```
+
+The text block contains `properties`, and the response also contains one or
+more `image` blocks under `visual`. The properties include hierarchy, bounds
+and render bounds, fills, gradients, typography, layout metadata, assets,
+effects, corner radii, constraints, grid/absolute placement, and prototype
+links when the host exposes them.
+
+Use both layers in the same reasoning pass:
+
+```text
+1. Read the image to understand appearance and visual hierarchy.
+2. Read properties.nodes to understand ownership and semantic structure.
+3. Prefer explicit layout metadata, constraints, and child positioning over raw coordinates.
+4. Reuse the destination repository's existing components and tokens.
+5. Implement the smallest responsive structure that explains the evidence.
+6. Render the implementation and compare it with the returned image.
+7. Fix the largest visual or structural mismatch, then repeat.
+```
+
+## Read a selection
+
+Use a selection for a component or a small group:
 
 ```json
 {
@@ -38,86 +63,11 @@ supported operations.
 }
 ```
 
-This returns a scoped context object containing the selected node references
-and normalized nodes. It is useful when asking an agent to explain or implement
-one component instead of an entire screen.
-
-## Read a screen or artboard
-
-Let the host choose the selected screen, or provide a screen ID returned by a
-previous context/export call:
-
-```json
-{
-  "tool": "design.get_screen_context",
-  "arguments": {
-    "host": "figma",
-    "screenId": "SCREEN_ID_FROM_CONTEXT"
-  }
-}
-```
-
-The same call works for XD by changing `host` to `"xd"` and using an XD node
-ID.
-
-## Read the visual context
-
-Render the same screen as PNG image content. The response includes image
-content plus node metadata such as the node ID, name, bounds, and scale:
+For a selection image, call:
 
 ```json
 {
   "tool": "design.get_visual_context",
-  "arguments": {
-    "host": "figma",
-    "scope": "screen",
-    "screenId": "SCREEN_ID_FROM_CONTEXT"
-  }
-}
-```
-
-## Read properties, visual, and code together
-
-Use the aggregate tool when an agent needs the complete implementation
-context in one MCP response. It returns the scoped `DesignIR` properties, a
-PNG image block, and the generated files for the selected target:
-
-```json
-{
-  "tool": "design.get_design_context",
-  "arguments": {
-    "host": "figma",
-    "scope": "screen",
-    "screenId": "SCREEN_ID_FROM_CONTEXT",
-    "target": "react",
-    "includeVisual": true
-  }
-}
-```
-
-This is the recommended input for an LLM. The model can compare the visual
-result with the hierarchy and layout metadata, then improve the generated
-implementation without treating pixel coordinates as the layout model.
-
-## Export the shared DesignIR
-
-Export a whole document:
-
-```json
-{
-  "tool": "design.export_ir",
-  "arguments": {
-    "host": "figma",
-    "scope": "document"
-  }
-}
-```
-
-Export only the selection:
-
-```json
-{
-  "tool": "design.export_ir",
   "arguments": {
     "host": "figma",
     "scope": "selection"
@@ -125,7 +75,10 @@ Export only the selection:
 }
 ```
 
-Export one screen:
+## Export only structured context
+
+Use this when the harness wants to keep the image and properties as separate
+messages or cache the normalized snapshot:
 
 ```json
 {
@@ -138,176 +91,77 @@ Export one screen:
 }
 ```
 
-Use the returned IR when you need a stable, host-neutral snapshot for a code
-review, a transformation, or another tool.
+The same operation supports `scope: "selection"` and `scope: "document"`.
 
-## Generate HTML
+## Recognize semantic layout
 
-```json
-{
-  "tool": "design.generate_code",
-  "arguments": {
-    "host": "figma",
-    "scope": "screen",
-    "screenId": "SCREEN_ID_FROM_CONTEXT",
-    "target": "html"
-  }
-}
-```
-
-The result contains a self-contained `designport-export.html` file. It is
-useful for quickly viewing the normalized geometry and hierarchy in a browser.
-
-## Generate React
+A Figma auto-layout frame is represented explicitly rather than reduced to a
+list of pixel offsets:
 
 ```json
 {
-  "tool": "design.generate_code",
-  "arguments": {
-    "host": "figma",
-    "scope": "screen",
-    "screenId": "SCREEN_ID_FROM_CONTEXT",
-    "target": "react"
-  }
-}
-```
-
-The result contains `DesignPortScreen.tsx` and `DesignPortScreen.css`. Treat
-these as a first pass: wire real data, keyboard behavior, responsive rules,
-and accessibility semantics in the application that consumes them.
-
-## Generate a web export
-
-Use the `web` target when you want a conventional browser output with a
-separate stylesheet:
-
-```json
-{
-  "tool": "design.generate_code",
-  "arguments": {
-    "host": "figma",
-    "scope": "screen",
-    "screenId": "SCREEN_ID_FROM_CONTEXT",
-    "target": "web"
-  }
-}
-```
-
-The result contains `index.html` and `styles.css`. The `html` target shown
-above is the single-file alternative.
-
-## Generate Vue
-
-```json
-{
-  "tool": "design.generate_code",
-  "arguments": {
-    "host": "figma",
-    "scope": "screen",
-    "screenId": "SCREEN_ID_FROM_CONTEXT",
-    "target": "vue"
-  }
-}
-```
-
-The result contains `DesignPortScreen.vue`, a Vue single-file component with a
-template and scoped styles.
-
-## Generate Flutter
-
-```json
-{
-  "tool": "design.generate_code",
-  "arguments": {
-    "host": "figma",
-    "scope": "screen",
-    "screenId": "SCREEN_ID_FROM_CONTEXT",
-    "target": "flutter"
-  }
-}
-```
-
-The result contains `design_port_screen.dart` with a `DesignPortApp` entry point
-and a `DesignPortScreen` `StatelessWidget`. It imports only
-`package:flutter/widgets.dart`, so it has no Material or Cupertino package
-dependency. The output uses the SDK's style-neutral core widgets and keeps
-layout semantics explicit: `Row`/`Column`/`Wrap`, `Expanded`/`Flexible`,
-`SizedBox`, `Stack`, and accessible `Semantics` actions.
-
-Auto-layout rows and columns become `Row`/`Column`; fill-sized siblings become
-`Expanded`, and hug-sized siblings become `Flexible`.
-
-## Generate SwiftUI
-
-```json
-{
-  "tool": "design.generate_code",
-  "arguments": {
-    "host": "figma",
-    "scope": "screen",
-    "screenId": "SCREEN_ID_FROM_CONTEXT",
-    "target": "swiftui"
-  }
-}
-```
-
-The result contains `DesignPortScreen.swift` with a SwiftUI `View` and a
-preview. It targets iOS 26+/macOS 26+ Liquid Glass APIs and keeps a material
-fallback for older deployment targets. Add it to an iOS or macOS target and
-replace the static placeholders with application data and behavior.
-
-## Generate Jetpack Compose
-
-```json
-{
-  "tool": "design.generate_code",
-  "arguments": {
-    "host": "figma",
-    "scope": "screen",
-    "screenId": "SCREEN_ID_FROM_CONTEXT",
-    "target": "compose"
-  }
-}
-```
-
-The result contains `DesignPortScreen.kt` with a `@Composable` function. Add
-the file to an Android Compose module with the latest stable Material 3
-dependency used by this generator:
-
-```kotlin
-implementation("androidx.compose.material3:material3:1.4.0")
-```
-
-The generated theme uses Material 3 dynamic color on Android 12+ and falls
-back to light/dark Material 3 schemes on older Android versions. Auto-layout
-rows and columns become `Row`/`Column`; fill-sized siblings become
-`weight(1f)`.
-
-## Generate a responsive split layout
-
-For a screen with a fixed sidebar and a fill-sized main panel, expose the
-screen's layout metadata in `DesignIR` (Figma Auto Layout does this directly):
-
-```json
-{
+  "id": "screen-1",
+  "kind": "screen",
   "layout": {
     "mode": "horizontal",
     "gap": 24,
-    "padding": { "top": 24, "right": 24, "bottom": 24, "left": 24 }
+    "padding": { "top": 24, "right": 24, "bottom": 24, "left": 24 },
+    "sizingHorizontal": "fixed",
+    "sizingVertical": "fixed",
+    "primaryAxisAlign": "min",
+    "counterAxisAlign": "stretch",
+    "wrap": "no-wrap"
+  },
+  "children": ["sidebar-1", "content-1"]
+}
+```
+
+The agent should infer a responsive split layout from this evidence: a fixed
+sidebar and a content region that fills the remaining width. A child with
+`layoutPositioning: "absolute"` is an intentional overlay and should remain
+positioned relative to its parent. Coordinates are still useful for checking
+the result and for genuinely free-form children; they are not the primary
+layout instruction when flow metadata exists.
+
+## Use exported assets correctly
+
+When available, an image or vector node contains an `asset` object:
+
+```json
+{
+  "kind": "path",
+  "asset": {
+    "kind": "vector",
+    "mimeType": "image/svg+xml",
+    "data": "<exported asset data>"
   }
 }
 ```
 
-Mark the sidebar as `sizingHorizontal: "fixed"` and the main panel as
-`sizingHorizontal: "fill"`. The same MCP call then produces CSS flex, Flutter
-`Row` + `Expanded`, SwiftUI `HStack` + an infinite-width frame, and Compose
-`Row` + `weight(1f)`. The agent can use the returned `DesignIR` properties to
-review or refine the result instead of reverse-engineering the layout from a
-screenshot.
+Use the exported asset itself for icons and images. Do not redraw an icon from
+its bounding box or replace a photo with a colored rectangle. If an asset is
+missing, keep the node's semantic role and report the limitation rather than
+pretending the visual is exact.
 
-## Create a screen
+## Visual comparison loop
 
-Use a scratch document while testing write operations:
+A useful harness prompt after the first implementation is:
+
+> Compare the current implementation with the DesignPort visual reference.
+> Check frame size, page background, major regions, order, spacing, text
+> wrapping, typography weight, asset presence, border radius, shadows, and
+> bottom navigation. List the three largest mismatches, fix only those, render
+> again, and repeat until the remaining differences are intentional.
+
+The loop should preserve semantic structure. A two-column design should remain
+a flex/grid or native row structure; adding dozens of absolute coordinates to
+hide a mismatch makes the implementation less responsive and harder to keep
+in sync.
+
+## Host writes
+
+Writes are deliberately separate from reads. Create a screen in a scratch file
+while testing:
 
 ```json
 {
@@ -317,46 +171,12 @@ Use a scratch document while testing write operations:
     "name": "DesignPort Example",
     "width": 390,
     "height": 844,
-    "background": {
-      "r": 0.96,
-      "g": 0.97,
-      "b": 0.98,
-      "a": 1
-    }
+    "background": { "r": 0.96, "g": 0.97, "b": 0.98, "a": 1 }
   }
 }
 ```
 
-The same normalized request is accepted by the XD adapter where the host
-supports it.
-
-## Create a basic component
-
-```json
-{
-  "tool": "design.create_component",
-  "arguments": {
-    "host": "figma",
-    "name": "Primary Button",
-    "width": 160,
-    "height": 48,
-    "kind": "component",
-    "text": "Continue",
-    "fill": {
-      "r": 0.12,
-      "g": 0.32,
-      "b": 0.86,
-      "a": 1
-    }
-  }
-}
-```
-
-Host capability responses are authoritative. For example, XD does not claim
-support for creating a new symbol definition when its runtime cannot perform
-that operation.
-
-## Update the current selection
+To apply a narrow change to the current selection:
 
 ```json
 {
@@ -366,43 +186,20 @@ that operation.
     "patch": {
       "name": "Primary Button / Hover",
       "opacity": 0.92,
-      "bounds": {
-        "width": 176
-      }
+      "bounds": { "width": 176 }
     }
   }
 }
 ```
 
-Keep write requests narrow and confirm the selected document before applying
-them. Figma applies supported writes immediately. XD queues writes for the
-explicit Apply action in its panel.
-
-## Inspect events
-
-```json
-{
-  "tool": "design.list_events",
-  "arguments": {
-    "host": "figma"
-  }
-}
-```
-
-Events include selection changes, document changes, and write status updates.
-The bridge keeps a bounded in-memory event log; it is not a permanent audit
-store.
+Keep write operations explicit and narrow. Figma applies supported writes
+immediately; XD queues writes for the user-initiated Apply action in its panel.
 
 ## A practical agent prompt
 
-After selecting a screen in Figma or XD, a useful prompt is:
-
-> Read the current screen with DesignPort. Summarize its hierarchy, identify
-> reusable components, and generate a React first pass. Do not modify the
-> design file.
-
-For an implementation pass:
-
-> Read the selected component with DesignPort. Generate React, preserve the
-> typography and spacing tokens you can infer, and list any assumptions before
-> writing application code.
+> Read the selected screen with DesignPort. First summarize its hierarchy,
+> layout model, reusable components, assets, states, and interactions. Then
+> implement it in the existing project stack using current repository
+> conventions. Use the DesignIR for structure and the PNG for visual truth.
+> Do not modify the design file. After rendering, compare the result and fix
+> the three largest mismatches.

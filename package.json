@@ -1,6 +1,6 @@
 {
   "name": "designport",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "license": "GPL-3.0-or-later",
   "description": "Local MCP bridge for Figma and Adobe XD design context.",
@@ -11,7 +11,8 @@
     "dev": "tsx watch src/index.ts",
     "start": "node dist/src/index.js",
     "test": "tsx --test test/*.test.ts",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "visual:compare": "tsx scripts/compare-png.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

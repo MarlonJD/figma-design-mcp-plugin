@@ -20,7 +20,7 @@ const bridge = new DesignPortBridge({
   host: process.env.DESIGNPORT_HOST ?? "127.0.0.1",
   port: portValue,
   requestTimeoutMs: timeoutValue,
-  serverVersion: "0.1.0",
+  serverVersion: "0.2.0",
 });
 
 const address = await bridge.start();

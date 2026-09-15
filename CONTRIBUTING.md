@@ -36,7 +36,7 @@ their host applications when a change touches a plugin runtime.
   host cannot perform safely.
 - Keep the default bridge local to the machine. Remote transport requires an
   explicit authentication and threat-model decision.
-- Keep generated output deterministic and readable enough for a human to
+- Keep exported output deterministic and readable enough for a human to
   inspect.
 - Update documentation and examples when a public tool, protocol message, or
   setup step changes.
@@ -50,6 +50,12 @@ npm test
 npm run typecheck
 npm run build
 git diff --check
+```
+
+When a screenshot fixture is available, also run:
+
+```bash
+npm run visual:compare -- reference.png candidate.png
 ```
 
 For plugin changes, also run the host-specific syntax checks where available:

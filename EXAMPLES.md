@@ -32,11 +32,13 @@ This is the normal design-to-implementation call. It returns a scoped
 }
 ```
 
-The text block contains `properties`, and the response also contains one or
-more `image` blocks under `visual`. The properties include hierarchy, bounds
-and render bounds, fills, gradients, typography, layout metadata, assets,
-effects, corner radii, constraints, grid/absolute placement, and prototype
-links when the host exposes them.
+The text block contains `properties`, followed by one or more `image` content
+blocks in the same MCP response. The properties include hierarchy, bounds and
+render bounds, fills, gradients, typography and mixed text ranges, layout
+metadata, tokens/style references, assets, effects, corner radii, transforms,
+component properties and variant states, accessibility signals, annotations,
+constraints, grid/absolute placement, and prototype links when the host
+exposes them.
 
 Use both layers in the same reasoning pass:
 
@@ -49,6 +51,29 @@ Use both layers in the same reasoning pass:
 6. Render the implementation and compare it with the returned image.
 7. Fix the largest visual or structural mismatch, then repeat.
 ```
+
+For a large screen, request a bounded first page and continue with the returned
+offset:
+
+```json
+{
+  "tool": "design.get_design_context",
+  "arguments": {
+    "host": "figma",
+    "scope": "screen",
+    "screenId": "SCREEN_ID_FROM_CONTEXT",
+    "maxNodes": 1000,
+    "includeAssets": true,
+    "maxAssetBytes": 2000000,
+    "includeTokens": true
+  }
+}
+```
+
+If `properties.pagination.hasMore` is `true`, call the same tool with
+`nodeOffset` set to `properties.pagination.nextOffset`. Use
+`properties.exportStats` to see how many assets and tokens were actually
+returned.
 
 ## Read a selection
 
@@ -109,7 +134,7 @@ list of pixel offsets:
     "sizingHorizontal": "fixed",
     "sizingVertical": "fixed",
     "primaryAxisAlign": "min",
-    "counterAxisAlign": "stretch",
+    "counterAxisAlign": "center",
     "wrap": "no-wrap"
   },
   "children": ["sidebar-1", "content-1"]
@@ -157,6 +182,35 @@ The loop should preserve semantic structure. A two-column design should remain
 a flex/grid or native row structure; adding dozens of absolute coordinates to
 hide a mismatch makes the implementation less responsive and harder to keep
 in sync.
+
+For a repeatable local gate, save the host PNG as `reference.png`, render the
+implementation at the same viewport as `properties.viewport`, and run:
+
+```bash
+npm run visual:compare -- reference.png candidate.png --json
+```
+
+The evaluator composites transparent pixels over white, checks dimensions first,
+and reports `changedBounds` so the agent can focus its next iteration. The
+default thresholds are intentionally small but not exact-pixel strict; tune
+them for anti-aliasing and font-rendering differences with
+`--pixel-threshold`, `--max-mae`, and `--max-changed`.
+
+## Tokens, states, and accessibility
+
+Use `node.styleRefs` and `properties.tokens` before inventing new colors,
+spacing values, or type styles. A Figma component/instance exposes
+`node.component.variantProperties`, `node.component.states`, and
+`node.component.properties`; an XD symbol instance exposes its symbol identity
+when XD makes it available. These fields are evidence, not generated framework
+code.
+
+Accessibility values explicitly stored by the DesignPort plugin data convention
+take precedence. The supported keys are `accessibility` (JSON) or individual
+`a11y.role`, `a11y.label`, `a11y.description`, `a11y.altText`,
+`a11y.headingLevel`, `a11y.focusable`, and `a11y.decorative` values. Name-based
+roles are marked `source: "inferred"` with a lower confidence so the agent
+must review them instead of treating them as final accessibility decisions.
 
 ## Host writes
 

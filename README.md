@@ -55,10 +55,16 @@ integration.
 - Read the current selection or a screen/artboard.
 - Render the current selection or a screen/artboard as PNG visual context.
 - Export a full document or a scoped `DesignIR` snapshot.
+- Export local styles and variables as tokens and preserve node style bindings.
+- Expose component properties, variants/states, text ranges, interactions,
+  annotations, and accessibility signals when the host provides them.
+- Paginate large documents and cap embedded asset bytes so an agent can request
+  context in deliberate chunks.
 - Report connected hosts, capabilities, and recent host events.
 - Create screens and basic components through host adapters.
 - Apply a normalized patch to the current selection.
 - Return properties and visual context together for agent review.
+- Compare implementation screenshots with a deterministic local PNG diff.
 - Keep the bridge on loopback (`127.0.0.1`) by default.
 
 The available MCP tools are:
@@ -79,7 +85,8 @@ The available MCP tools are:
 | `design.ping` | Check that a host can receive requests. |
 
 See [EXAMPLES.md](EXAMPLES.md) for ready-to-copy tool arguments and common
-workflows.
+workflows, and [DESIGN_IR.md](DESIGN_IR.md) for the normalized contract and
+layout interpretation guide.
 
 ### What the MCP gives the agent
 
@@ -88,7 +95,9 @@ response contains two complementary evidence layers:
 
 1. `properties`: the scoped `DesignIR` data — hierarchy, host-neutral node
    kinds, bounds and render bounds, fills, typography, assets, effects, corner
-   radii, constraints, layout metadata, and prototype links.
+   radii, transforms, constraints, layout metadata, tokens, component
+   properties/variants, text ranges, accessibility signals, and prototype
+   links.
 2. A PNG image content block: the visual truth of the selected screen or
    component.
 
@@ -96,7 +105,10 @@ The MCP server supplies evidence; the LLM decides component boundaries,
 behavior, accessibility, and the correct primitives for the destination
 stack. DesignPort intentionally does not emit framework code. This keeps
 React, Vue, HTML, Flutter, SwiftUI, Compose, and future stacks under the
-target repository's own conventions and current dependency versions.
+target repository's own conventions and current dependency versions. No
+framework imports or stale UI-library choices are hidden in this project; the
+agent should inspect the target repository before choosing its current web,
+Flutter, SwiftUI, or Compose APIs.
 
 ### DesignIR contract
 
@@ -104,14 +116,23 @@ target repository's own conventions and current dependency versions.
 for visual comparison and genuinely free-form placement, while explicit
 layout metadata describes the intended structure: horizontal/vertical/grid
 flow, gap, padding, fixed/hug/fill sizing, alignment, wrapping, absolute
-positioning, constraints, and grid placement. Figma vector and image assets
-are carried as local data when the host can export them, so an agent does not
-have to redraw icons or substitute screenshots.
+positioning, constraints, and grid placement. Tokens and style references keep
+the design system visible; component properties and variant values preserve
+state decisions; text ranges preserve mixed typography; and prototype links,
+annotations, and accessibility fields expose behavior and implementation
+signals. Figma and XD vector/image assets are carried as local data when the
+host can export them, so an agent does not have to redraw icons or substitute
+screenshots.
 
 The visual PNG remains mandatory evidence. An agent should use the two layers
 together: the IR explains what the design is made of, and the image verifies
 what it looks like. Neither layer is treated as an instruction supplied by
 the design file.
+
+For large screens, pass `maxNodes`, `nodeOffset`, `includeAssets`,
+`maxAssetBytes`, and `includeTokens` to the context/export tools. The response
+contains `pagination` and `exportStats`, so a harness can request the next page
+without guessing whether a node or asset was omitted.
 
 ## Requirements
 
@@ -222,6 +243,16 @@ With the bridge and one plugin connected, ask the MCP client to:
 4. Have the agent implement the result using the target repository's existing
    components and current framework conventions.
 
+After the first render, run the local visual check against the same viewport:
+
+```bash
+npm run visual:compare -- reference.png candidate.png
+```
+
+The command reports similarity, mean pixel error, changed-pixel ratio, and the
+smallest bounding box containing the difference. It returns a non-zero exit
+code when the configured visual thresholds fail.
+
 Use `design.get_selection_context`, `design.get_screen_context`, and
 `design.get_visual_context` separately when you want a smaller response or a
 different stage of the workflow. See the agent-harness examples in
@@ -250,6 +281,8 @@ The project layout is intentionally simple:
 src/core/       DesignIR and protocol contracts
 src/bridge/     Local WebSocket host bridge
 src/mcp/        MCP tool registration
+src/eval/       Deterministic PNG visual comparison
+scripts/        Local evaluation commands
 plugins/figma/  Figma development plugin
 plugins/xd/     Adobe XD UXP development plugin
 test/           Protocol, IR, and bridge tests

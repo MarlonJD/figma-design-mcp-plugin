@@ -55,6 +55,46 @@ export const affineTransformSchema = z.object({
 });
 export type AffineTransform = z.infer<typeof affineTransformSchema>;
 
+const arbitraryValueSchema = z.unknown();
+
+export const tokenModeSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+});
+export type TokenMode = z.infer<typeof tokenModeSchema>;
+
+export const designTokenSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  type: z.enum([
+    "color",
+    "number",
+    "string",
+    "boolean",
+    "typography",
+    "effect",
+    "grid",
+    "unknown",
+  ]),
+  value: arbitraryValueSchema.optional(),
+  valuesByMode: z.record(z.string(), arbitraryValueSchema).optional(),
+  collectionId: z.string().min(1).optional(),
+  collectionName: z.string().min(1).optional(),
+  modes: z.array(tokenModeSchema).optional(),
+  description: z.string().optional(),
+  scopes: z.array(z.string().min(1)).optional(),
+  codeSyntax: z.record(z.string(), z.string()).optional(),
+  source: z.enum([
+    "variable",
+    "paint-style",
+    "text-style",
+    "effect-style",
+    "grid-style",
+    "unknown",
+  ]),
+});
+export type DesignToken = z.infer<typeof designTokenSchema>;
+
 export const fillSchema = z.object({
   type: z.enum(["solid", "gradient", "image", "unknown"]),
   color: colorSchema.optional(),
@@ -67,6 +107,9 @@ export const fillSchema = z.object({
     position: z.number().min(0).max(1),
     color: colorSchema,
   })).optional(),
+  gradientHandles: z.array(pointSchema).optional(),
+  gradientCenter: pointSchema.optional(),
+  gradientRadius: z.number().finite().nonnegative().optional(),
   gradientTransform: affineTransformSchema.optional(),
   imageScaleMode: z.enum(["fill", "fit", "crop", "tile"]).optional(),
   imageTransform: affineTransformSchema.optional(),
@@ -107,6 +150,7 @@ export const designAssetSchema = z.object({
   data: z.string().min(1),
   kind: z.enum(["image", "vector"]).optional(),
   imageScaleMode: z.enum(["fill", "fit", "crop", "tile"]).optional(),
+  byteSize: z.number().int().nonnegative().optional(),
 });
 export type DesignAsset = z.infer<typeof designAssetSchema>;
 
@@ -193,7 +237,17 @@ export const prototypeLinkSchema = z.object({
   navigation: z.string().min(1).optional(),
   transition: z.string().optional(),
   duration: z.number().finite().nonnegative().optional(),
+  delay: z.number().finite().nonnegative().optional(),
+  easing: z.string().min(1).optional(),
+  direction: z.string().min(1).optional(),
+  matchLayers: z.boolean().optional(),
+  overlayPosition: pointSchema.optional(),
+  openInNewTab: z.boolean().optional(),
   preserveScrollPosition: z.boolean().optional(),
+  resetScrollPosition: z.boolean().optional(),
+  resetInteractiveComponents: z.boolean().optional(),
+  mediaAction: z.string().min(1).optional(),
+  data: z.record(z.string(), arbitraryValueSchema).optional(),
 });
 export type PrototypeLink = z.infer<typeof prototypeLinkSchema>;
 
@@ -202,6 +256,125 @@ export const nodeRefSchema = z.object({
   id: z.string().min(1),
 });
 export type NodeRef = z.infer<typeof nodeRefSchema>;
+
+export const designStyleRefsSchema = z.object({
+  fill: z.string().min(1).optional(),
+  stroke: z.string().min(1).optional(),
+  text: z.string().min(1).optional(),
+  effect: z.string().min(1).optional(),
+  grid: z.string().min(1).optional(),
+});
+export type DesignStyleRefs = z.infer<typeof designStyleRefsSchema>;
+
+export const textSegmentSchema = z.object({
+  start: z.number().int().nonnegative(),
+  end: z.number().int().nonnegative(),
+  characters: z.string(),
+  typography: typographySchema.optional(),
+  fills: z.array(fillSchema).optional(),
+  styleRefs: designStyleRefsSchema.optional(),
+  hyperlink: arbitraryValueSchema.optional(),
+});
+export type TextSegment = z.infer<typeof textSegmentSchema>;
+
+export const variableBindingsSchema = z.record(
+  z.string().min(1),
+  z.array(z.string().min(1)).min(1),
+);
+export type VariableBindings = z.infer<typeof variableBindingsSchema>;
+
+export const componentPropertySchema = z.object({
+  key: z.string().min(1),
+  name: z.string().min(1),
+  type: z.enum(["boolean", "text", "instance-swap", "variant", "unknown"]),
+  value: arbitraryValueSchema.optional(),
+  defaultValue: arbitraryValueSchema.optional(),
+  variantOptions: z.array(z.string()).optional(),
+  preferredValues: z.array(z.object({
+    type: z.enum(["component", "component-set", "unknown"]),
+    key: z.string().min(1).optional(),
+  })).optional(),
+});
+export type ComponentProperty = z.infer<typeof componentPropertySchema>;
+
+export const componentMetadataSchema = z.object({
+  id: z.string().min(1),
+  setId: z.string().min(1).optional(),
+  name: z.string().min(1).optional(),
+  description: z.string().optional(),
+  variantProperties: z.record(z.string(), z.string()).optional(),
+  states: z.record(z.string(), z.string()).optional(),
+  properties: z.array(componentPropertySchema).optional(),
+  mainComponentId: z.string().min(1).optional(),
+  isVariant: z.boolean().optional(),
+  isInstance: z.boolean().optional(),
+});
+export type ComponentMetadata = z.infer<typeof componentMetadataSchema>;
+
+export const accessibilitySchema = z.object({
+  role: z.string().min(1).optional(),
+  label: z.string().optional(),
+  description: z.string().optional(),
+  altText: z.string().optional(),
+  headingLevel: z.number().int().min(1).max(6).optional(),
+  focusable: z.boolean().optional(),
+  decorative: z.boolean().optional(),
+  source: z.enum(["explicit", "inferred"]).optional(),
+  confidence: z.number().min(0).max(1).optional(),
+});
+export type Accessibility = z.infer<typeof accessibilitySchema>;
+
+export const annotationSchema = z.object({
+  label: z.string().optional(),
+  labelMarkdown: z.string().optional(),
+  categoryId: z.string().min(1).optional(),
+  properties: z.array(z.string().min(1)).optional(),
+});
+export type Annotation = z.infer<typeof annotationSchema>;
+
+export const viewportSchema = z.object({
+  width: z.number().finite().positive(),
+  height: z.number().finite().positive(),
+  orientation: z.enum(["portrait", "landscape", "square"]),
+  breakpoint: z.enum(["compact", "medium", "expanded"]),
+});
+export type Viewport = z.infer<typeof viewportSchema>;
+
+export const screenDetailSchema = z.object({
+  node: nodeRefSchema,
+  name: z.string(),
+  viewport: viewportSchema,
+});
+export type ScreenDetail = z.infer<typeof screenDetailSchema>;
+
+export const paginationSchema = z.object({
+  offset: z.number().int().nonnegative(),
+  limit: z.number().int().positive(),
+  total: z.number().int().nonnegative(),
+  returned: z.number().int().nonnegative(),
+  hasMore: z.boolean(),
+  nextOffset: z.number().int().nonnegative().optional(),
+});
+export type Pagination = z.infer<typeof paginationSchema>;
+
+export const exportStatsSchema = z.object({
+  totalNodes: z.number().int().nonnegative(),
+  returnedNodes: z.number().int().nonnegative(),
+  assetCount: z.number().int().nonnegative(),
+  assetBytes: z.number().int().nonnegative(),
+  assetsOmitted: z.number().int().nonnegative(),
+  tokenCount: z.number().int().nonnegative(),
+});
+export type ExportStats = z.infer<typeof exportStatsSchema>;
+
+export const exportOptionsSchema = z.object({
+  maxNodes: z.number().int().positive().max(10000).default(5000),
+  nodeOffset: z.number().int().nonnegative().max(1000000).default(0),
+  includeAssets: z.boolean().default(true),
+  maxAssetBytes: z.number().int().positive().max(50000000).default(4000000),
+  includeTokens: z.boolean().default(true),
+});
+export type ExportOptions = z.infer<typeof exportOptionsSchema>;
 
 const unknownRecordSchema = z.record(z.string(), z.unknown());
 
@@ -215,6 +388,7 @@ export const designNodeSchema = z.object({
   renderBounds: boundsSchema.nullable().optional(),
   visible: z.boolean(),
   locked: z.boolean().optional(),
+  description: z.string().optional(),
   opacity: z.number().min(0).max(1).optional(),
   blendMode: z.string().min(1).optional(),
   fills: z.array(fillSchema).optional(),
@@ -229,6 +403,7 @@ export const designNodeSchema = z.object({
   }).optional(),
   asset: designAssetSchema.optional(),
   rotation: z.number().finite().optional(),
+  transform: affineTransformSchema.optional(),
   clipsContent: z.boolean().optional(),
   minWidth: z.number().finite().nonnegative().optional(),
   maxWidth: z.number().finite().nonnegative().optional(),
@@ -244,7 +419,13 @@ export const designNodeSchema = z.object({
     rowSpan: z.number().int().positive().optional(),
     columnSpan: z.number().int().positive().optional(),
   }).optional(),
+  styleRefs: designStyleRefsSchema.optional(),
+  variableBindings: variableBindingsSchema.optional(),
+  component: componentMetadataSchema.optional(),
+  accessibility: accessibilitySchema.optional(),
+  annotations: z.array(annotationSchema).optional(),
   text: z.string().optional(),
+  textSegments: z.array(textSegmentSchema).optional(),
   typography: typographySchema.optional(),
   layout: layoutSchema.optional(),
   prototypeLinks: z.array(prototypeLinkSchema).optional(),
@@ -256,6 +437,8 @@ export const hostCapabilitiesSchema = z.object({
   host: hostKindSchema,
   pluginVersion: z.string(),
   operations: z.array(z.string()),
+  features: z.array(z.string()).optional(),
+  limitations: z.array(z.string()).optional(),
   supports: z.object({
     documentRead: z.boolean(),
     selectionRead: z.boolean(),
@@ -279,6 +462,10 @@ export const designIRSchema = z.object({
   selection: z.array(nodeRefSchema),
   exportedAt: z.string().datetime({ offset: true }),
   capabilities: hostCapabilitiesSchema.optional(),
+  tokens: z.array(designTokenSchema).optional(),
+  screenDetails: z.array(screenDetailSchema).optional(),
+  pagination: paginationSchema.optional(),
+  exportStats: exportStatsSchema.optional(),
 });
 export type DesignIR = z.infer<typeof designIRSchema>;
 
@@ -291,6 +478,10 @@ export const contextIRSchema = z.object({
   selection: z.array(nodeRefSchema),
   nodes: z.array(designNodeSchema),
   screenId: z.string().optional(),
+  viewport: viewportSchema.optional(),
+  tokens: z.array(designTokenSchema).optional(),
+  pagination: paginationSchema.optional(),
+  exportStats: exportStatsSchema.optional(),
   exportedAt: z.string().datetime({ offset: true }),
 });
 export type ContextIR = z.infer<typeof contextIRSchema>;

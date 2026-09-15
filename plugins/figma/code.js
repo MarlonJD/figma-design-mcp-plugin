@@ -1,9 +1,23 @@
 const BRIDGE_PROTOCOL_VERSION = 1;
-const PLUGIN_VERSION = "0.1.0";
+const PLUGIN_VERSION = "0.2.0";
 
 const CAPABILITIES = {
   host: "figma",
   pluginVersion: PLUGIN_VERSION,
+  features: [
+    "design-ir",
+    "visual-context",
+    "tokens",
+    "style-bindings",
+    "component-properties",
+    "variant-states",
+    "text-ranges",
+    "interactions",
+    "accessibility-signals",
+    "responsive-layout",
+    "asset-export",
+    "pagination",
+  ],
   operations: [
     "ping",
     "get_capabilities",
@@ -29,11 +43,54 @@ const CAPABILITIES = {
 const MAX_ASSET_EXPORTS_PER_REQUEST = 64;
 const assetCache = new Map();
 const assetPromises = new Map();
+const tokenCache = new Map();
+
+const DEFAULT_EXPORT_OPTIONS = {
+  maxNodes: 5000,
+  nodeOffset: 0,
+  includeAssets: true,
+  maxAssetBytes: 4000000,
+  includeTokens: true,
+};
 
 figma.showUI(__html__, { visible: false, width: 1, height: 1 });
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, Number(value) || 0));
+}
+
+function exportOptionsFor(payload) {
+  const input = payload && payload.options && typeof payload.options === "object"
+    ? payload.options
+    : {};
+  return {
+    maxNodes: Number.isInteger(input.maxNodes) && input.maxNodes > 0
+      ? Math.min(10000, input.maxNodes)
+      : DEFAULT_EXPORT_OPTIONS.maxNodes,
+    nodeOffset: Number.isInteger(input.nodeOffset) && input.nodeOffset >= 0
+      ? Math.min(1000000, input.nodeOffset)
+      : DEFAULT_EXPORT_OPTIONS.nodeOffset,
+    includeAssets: input.includeAssets !== false,
+    maxAssetBytes: Number.isInteger(input.maxAssetBytes) && input.maxAssetBytes > 0
+      ? Math.min(50000000, input.maxAssetBytes)
+      : DEFAULT_EXPORT_OPTIONS.maxAssetBytes,
+    includeTokens: input.includeTokens !== false,
+  };
+}
+
+function exportStateFor(options) {
+  return {
+    options,
+    assetExports: 0,
+    assetCount: 0,
+    assetBytes: 0,
+    assetsOmitted: 0,
+  };
+}
+
+function utf8ByteLength(value) {
+  if (typeof TextEncoder === "function") return new TextEncoder().encode(value).length;
+  return value.length;
 }
 
 function affineTransformFor(value) {
@@ -144,6 +201,9 @@ function paintsToIR(paints) {
             ...(Number.isFinite(stop.color.a) ? { a: clamp(stop.color.a, 0, 1) } : {}),
           },
         })),
+        ...(Array.isArray(paint.gradientHandlePositions) && paint.gradientHandlePositions.every((point) => point && Number.isFinite(point.x) && Number.isFinite(point.y))
+          ? { gradientHandles: paint.gradientHandlePositions.map((point) => ({ x: point.x, y: point.y })) }
+          : {}),
         ...(affineTransformFor(paint.gradientTransform) ? { gradientTransform: affineTransformFor(paint.gradientTransform) } : {}),
         ...common,
       };
@@ -185,9 +245,9 @@ function strokesToIR(node) {
   }));
 }
 
-function effectsToIR(node) {
-  if (!Array.isArray(node.effects) || !node.effects.length) return undefined;
-  return node.effects.map((effect) => {
+function effectListToIR(effects) {
+  if (!Array.isArray(effects) || !effects.length) return undefined;
+  return effects.map((effect) => {
     const type = {
       DROP_SHADOW: "drop-shadow",
       INNER_SHADOW: "inner-shadow",
@@ -218,6 +278,10 @@ function effectsToIR(node) {
   });
 }
 
+function effectsToIR(node) {
+  return effectListToIR(node.effects);
+}
+
 function cornersToIR(node) {
   const result = {};
   if (typeof node.cornerRadius === "number" && Number.isFinite(node.cornerRadius) && node.cornerRadius > 0) {
@@ -242,7 +306,7 @@ function assetCacheKey(node) {
 }
 
 async function assetFor(node, exportState) {
-  if (node.visible === false) return undefined;
+  if (!exportState.options.includeAssets || node.visible === false) return undefined;
   const isVector = node.type === "VECTOR" || node.type === "BOOLEAN_OPERATION" || node.type === "POLYGON" || node.type === "STAR";
   const imagePaint = Array.isArray(node.fills)
     ? node.fills.find((paint) => paint && paint.type === "IMAGE" && paint.imageHash)
@@ -250,10 +314,31 @@ async function assetFor(node, exportState) {
   if (!isVector && !imagePaint) return undefined;
 
   const key = assetCacheKey(node);
-  if (assetCache.has(key)) return assetCache.get(key);
+  const includeAsset = (asset) => {
+    if (!asset) {
+      exportState.assetsOmitted += 1;
+      return undefined;
+    }
+    const byteSize = Number.isFinite(asset.byteSize)
+      ? asset.byteSize
+      : typeof asset.data === "string"
+        ? utf8ByteLength(asset.data)
+        : 0;
+    if (exportState.assetBytes + byteSize > exportState.options.maxAssetBytes) {
+      exportState.assetsOmitted += 1;
+      return undefined;
+    }
+    exportState.assetCount += 1;
+    exportState.assetBytes += byteSize;
+    return asset;
+  };
+  if (assetCache.has(key)) return includeAsset(assetCache.get(key));
   const pending = assetPromises.get(key);
-  if (pending) return pending;
-  if (exportState.assetExports >= MAX_ASSET_EXPORTS_PER_REQUEST) return undefined;
+  if (pending) return includeAsset(await pending);
+  if (exportState.assetExports >= MAX_ASSET_EXPORTS_PER_REQUEST) {
+    exportState.assetsOmitted += 1;
+    return undefined;
+  }
   exportState.assetExports += 1;
 
   const promise = (async () => {
@@ -261,7 +346,12 @@ async function assetFor(node, exportState) {
       if (isVector) {
         const svg = await node.exportAsync({ format: "SVG_STRING", contentsOnly: true });
         if (typeof svg === "string" && svg.trim()) {
-          return { mimeType: "image/svg+xml", data: svg, kind: "vector" };
+          return {
+            mimeType: "image/svg+xml",
+            data: svg,
+            kind: "vector",
+            byteSize: utf8ByteLength(svg),
+          };
         }
       }
       if (!imagePaint) return undefined;
@@ -270,6 +360,7 @@ async function assetFor(node, exportState) {
         mimeType: "image/png",
         data: figma.base64Encode(bytes),
         kind: "image",
+        byteSize: bytes.length,
         ...(typeof imagePaint.scaleMode === "string" ? { imageScaleMode: imagePaint.scaleMode.toLowerCase() } : {}),
       };
     } catch (_error) {
@@ -281,16 +372,16 @@ async function assetFor(node, exportState) {
   try {
     const asset = await promise;
     assetCache.set(key, asset);
-    return asset;
+    return includeAsset(asset);
   } finally {
     assetPromises.delete(key);
   }
 }
 
-function typographyFor(node) {
-  if (node.type !== "TEXT") return undefined;
+function typographyFromValue(node) {
+  if (!node) return undefined;
   const result = {};
-  if (node.fontName && node.fontName !== figma.mixed) {
+  if (node.fontName && node.fontName !== figma.mixed && typeof node.fontName === "object") {
     if (typeof node.fontName.family === "string") result.family = node.fontName.family;
     if (typeof node.fontName.style === "string") result.style = node.fontName.style;
   }
@@ -356,6 +447,442 @@ function typographyFor(node) {
     result.align = node.textAlignHorizontal.toLowerCase();
   }
   return Object.keys(result).length ? result : undefined;
+}
+
+function typographyFor(node) {
+  return node.type === "TEXT" ? typographyFromValue(node) : undefined;
+}
+
+function textSegmentsFor(node) {
+  if (node.type !== "TEXT" || typeof node.getStyledTextSegments !== "function") return undefined;
+  const segments = safeRead(() => node.getStyledTextSegments([
+    "fontName",
+    "fontSize",
+    "fontWeight",
+    "textDecoration",
+    "textCase",
+    "lineHeight",
+    "letterSpacing",
+    "fills",
+    "textStyleId",
+    "fillStyleId",
+    "hyperlink",
+    "paragraphIndent",
+    "paragraphSpacing",
+  ]), []);
+  if (!Array.isArray(segments) || !segments.length) return undefined;
+  return segments.map((segment) => {
+    const styleRefs = {};
+    const textStyleId = nonEmptyString(segment.textStyleId);
+    const fillStyleId = nonEmptyString(segment.fillStyleId);
+    if (textStyleId) styleRefs.text = textStyleId;
+    if (fillStyleId) styleRefs.fill = fillStyleId;
+    const typography = typographyFromValue(segment);
+    return {
+      start: segment.start,
+      end: segment.end,
+      characters: typeof segment.characters === "string" ? segment.characters : "",
+      ...(typography ? { typography } : {}),
+      ...(Array.isArray(segment.fills) && segment.fills.length ? { fills: paintsToIR(segment.fills) } : {}),
+      ...(Object.keys(styleRefs).length ? { styleRefs } : {}),
+      ...(segment.hyperlink ? { hyperlink: tokenValueFor(segment.hyperlink) } : {}),
+    };
+  });
+}
+
+function safeRead(read, fallback) {
+  try {
+    const value = read();
+    return value === undefined || value === null ? fallback : value;
+  } catch (_error) {
+    return fallback;
+  }
+}
+
+function nonEmptyString(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function styleRefsFor(node) {
+  const refs = {};
+  const fields = {
+    fill: node.fillStyleId,
+    stroke: node.strokeStyleId,
+    text: node.textStyleId,
+    effect: node.effectStyleId,
+    grid: node.gridStyleId,
+  };
+  Object.entries(fields).forEach(([key, value]) => {
+    const id = nonEmptyString(value);
+    if (id) refs[key] = id;
+  });
+  return Object.keys(refs).length ? refs : undefined;
+}
+
+function variableBindingsFor(node) {
+  const bound = safeRead(() => node.boundVariables, undefined);
+  if (!bound || typeof bound !== "object") return undefined;
+  const result = {};
+  Object.entries(bound).forEach(([field, value]) => {
+    const values = Array.isArray(value) ? value : [value];
+    const ids = values
+      .filter((item) => item && typeof item === "object" && item.type === "VARIABLE_ALIAS")
+      .map((item) => item.id)
+      .filter((id) => typeof id === "string" && id.length > 0);
+    if (ids.length) result[field] = ids;
+  });
+  return Object.keys(result).length ? result : undefined;
+}
+
+function componentPropertyTypeFor(value) {
+  return {
+    BOOLEAN: "boolean",
+    TEXT: "text",
+    INSTANCE_SWAP: "instance-swap",
+    VARIANT: "variant",
+  }[value] || "unknown";
+}
+
+function componentPropertiesFor(definitions, values) {
+  const names = new Set([
+    ...Object.keys(definitions && typeof definitions === "object" ? definitions : {}),
+    ...Object.keys(values && typeof values === "object" ? values : {}),
+  ]);
+  const properties = [];
+  names.forEach((key) => {
+    const definition = definitions && definitions[key] && typeof definitions[key] === "object"
+      ? definitions[key]
+      : {};
+    const value = values && values[key] && typeof values[key] === "object"
+      ? values[key]
+      : {};
+    const source = Object.keys(value).length ? value : definition;
+    const type = componentPropertyTypeFor(source.type || definition.type);
+    const property = {
+      key,
+      name: key.replace(/#.*$/, ""),
+      type,
+      ...(Object.prototype.hasOwnProperty.call(value, "value") ? { value: value.value } : {}),
+      ...(Object.prototype.hasOwnProperty.call(definition, "defaultValue") ? { defaultValue: definition.defaultValue } : {}),
+      ...(Array.isArray(definition.variantOptions) ? { variantOptions: [...definition.variantOptions] } : {}),
+      ...(Array.isArray(definition.preferredValues) ? {
+        preferredValues: definition.preferredValues.map((item) => ({
+          type: {
+            COMPONENT: "component",
+            COMPONENT_SET: "component-set",
+          }[item.type] || "unknown",
+          ...(typeof item.key === "string" ? { key: item.key } : {}),
+        })),
+      } : {}),
+    };
+    properties.push(property);
+  });
+  return properties.length ? properties : undefined;
+}
+
+function statesFor(variantProperties) {
+  if (!variantProperties || typeof variantProperties !== "object") return undefined;
+  const states = {};
+  Object.entries(variantProperties).forEach(([key, value]) => {
+    if (typeof value !== "string") return;
+    if (/(state|status|interaction|mode)/i.test(key)) states[key] = value;
+  });
+  return Object.keys(states).length ? states : undefined;
+}
+
+function componentFor(node) {
+  const isInstance = node.type === "INSTANCE";
+  const isComponent = node.type === "COMPONENT" || node.type === "COMPONENT_SET";
+  const mainComponent = isInstance ? safeRead(() => node.mainComponent, null) : null;
+  const base = isComponent ? node : mainComponent;
+  const variantProperties = safeRead(() => node.variantProperties, null);
+  const definitions = safeRead(
+    () => (node.componentPropertyDefinitions || (base && base.componentPropertyDefinitions)),
+    undefined,
+  );
+  const values = isInstance ? safeRead(() => node.componentProperties, undefined) : undefined;
+  if (!base && !variantProperties && !definitions) return undefined;
+
+  const parent = base && base.parent && base.parent.type === "COMPONENT_SET"
+    ? base.parent
+    : null;
+  const variant = variantProperties && typeof variantProperties === "object"
+    ? Object.fromEntries(Object.entries(variantProperties).filter(([, value]) => typeof value === "string"))
+    : undefined;
+  const baseId = base && typeof base.id === "string" ? base.id : node.id;
+  const properties = componentPropertiesFor(definitions, values);
+  const states = statesFor(variant);
+  return {
+    id: baseId,
+    ...(parent && typeof parent.id === "string" ? { setId: parent.id } : {}),
+    ...(base && nonEmptyString(base.name) ? { name: base.name } : {}),
+    ...(base && nonEmptyString(base.description) ? { description: base.description } : {}),
+    ...(variant && Object.keys(variant).length ? { variantProperties: variant } : {}),
+    ...(properties ? { properties } : {}),
+    ...(states ? { states } : {}),
+    ...(mainComponent && typeof mainComponent.id === "string" ? { mainComponentId: mainComponent.id } : {}),
+    ...(parent || (isComponent && node.parent && node.parent.type === "COMPONENT_SET") ? { isVariant: true } : {}),
+    ...(isInstance ? { isInstance: true } : {}),
+  };
+}
+
+function annotationsFor(node) {
+  const annotations = safeRead(() => node.annotations, undefined);
+  if (!Array.isArray(annotations) || !annotations.length) return undefined;
+  const result = annotations.map((annotation) => ({
+    ...(typeof annotation.label === "string" ? { label: annotation.label } : {}),
+    ...(typeof annotation.labelMarkdown === "string" ? { labelMarkdown: annotation.labelMarkdown } : {}),
+    ...(typeof annotation.categoryId === "string" ? { categoryId: annotation.categoryId } : {}),
+    ...(Array.isArray(annotation.properties) ? {
+      properties: annotation.properties
+        .map((property) => property && property.type)
+        .filter((type) => typeof type === "string"),
+    } : {}),
+  }));
+  return result.length ? result : undefined;
+}
+
+function pluginDataFor(node, key) {
+  return nonEmptyString(safeRead(() => node.getSharedPluginData("designport", key), ""));
+}
+
+function booleanData(value) {
+  if (value === undefined) return undefined;
+  if (value === "true" || value === "1") return true;
+  if (value === "false" || value === "0") return false;
+  return undefined;
+}
+
+function inferredAccessibilityFor(node) {
+  const name = `${node.name || ""} ${node.type || ""}`.toLowerCase();
+  const headingMatch = name.match(/(?:^|[\s/_-])h([1-6])(?:$|[\s/_-])|(?:^|[\s/_-])heading(?:$|[\s/_-])/);
+  if (headingMatch || node.type === "TEXT" && /title|heading/.test(name)) {
+    return {
+      role: "heading",
+      ...(headingMatch && headingMatch[1] ? { headingLevel: Number(headingMatch[1]) } : {}),
+      confidence: 0.55,
+    };
+  }
+  const rolePatterns = [
+    ["button", /button|cta/],
+    ["link", /link|hyperlink/],
+    ["checkbox", /checkbox/],
+    ["switch", /switch|toggle/],
+    ["textbox", /input|textfield|text-field|search/],
+    ["tab", /tab/],
+    ["navigation", /navigation|navbar|nav-bar|bottom-nav/],
+    ["img", /image|photo|avatar|thumbnail/],
+  ];
+  const match = rolePatterns.find(([, pattern]) => pattern.test(name));
+  return match ? { role: match[0], confidence: 0.4 } : undefined;
+}
+
+function accessibilityFor(node) {
+  let configured = {};
+  const rawConfig = pluginDataFor(node, "accessibility");
+  if (rawConfig) {
+    try {
+      const parsed = JSON.parse(rawConfig);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) configured = parsed;
+    } catch (_error) {
+      configured = {};
+    }
+  }
+  const configuredRole = nonEmptyString(configured.role) || pluginDataFor(node, "a11y.role");
+  const configuredLabel = typeof configured.label === "string" ? configured.label : pluginDataFor(node, "a11y.label");
+  const configuredDescription = typeof configured.description === "string"
+    ? configured.description
+    : pluginDataFor(node, "a11y.description");
+  const configuredAltText = typeof configured.altText === "string" ? configured.altText : pluginDataFor(node, "a11y.altText");
+  const configuredHeadingLevel = Number(configured.headingLevel || pluginDataFor(node, "a11y.headingLevel"));
+  const configuredFocusable = typeof configured.focusable === "boolean"
+    ? configured.focusable
+    : booleanData(pluginDataFor(node, "a11y.focusable"));
+  const configuredDecorative = typeof configured.decorative === "boolean"
+    ? configured.decorative
+    : booleanData(pluginDataFor(node, "a11y.decorative"));
+  const inferred = inferredAccessibilityFor(node) || {};
+  const explicit = Boolean(
+    configuredRole
+    || configuredLabel !== undefined
+    || configuredDescription !== undefined
+    || configuredAltText !== undefined
+    || Number.isInteger(configuredHeadingLevel)
+    || configuredFocusable !== undefined
+    || configuredDecorative !== undefined,
+  );
+  const role = configuredRole || inferred.role;
+  const label = configuredLabel !== undefined
+    ? configuredLabel
+    : role && ["button", "link", "tab", "img", "textbox"].includes(role) && node.type === "TEXT"
+      ? node.characters
+      : undefined;
+  const description = configuredDescription || nonEmptyString(node.description);
+  const headingLevel = Number.isInteger(configuredHeadingLevel) && configuredHeadingLevel >= 1 && configuredHeadingLevel <= 6
+    ? configuredHeadingLevel
+    : inferred.headingLevel;
+  if (!role && label === undefined && description === undefined && configuredAltText === undefined && headingLevel === undefined
+    && configuredFocusable === undefined && configuredDecorative === undefined) return undefined;
+  return {
+    ...(role ? { role } : {}),
+    ...(label !== undefined ? { label } : {}),
+    ...(description !== undefined ? { description } : {}),
+    ...(configuredAltText !== undefined ? { altText: configuredAltText } : {}),
+    ...(headingLevel !== undefined ? { headingLevel } : {}),
+    ...(configuredFocusable !== undefined ? { focusable: configuredFocusable } : {}),
+    ...(configuredDecorative !== undefined ? { decorative: configuredDecorative } : {}),
+    source: explicit ? "explicit" : "inferred",
+    confidence: explicit ? 1 : inferred.confidence,
+  };
+}
+
+function tokenValueFor(value) {
+  if (Array.isArray(value)) return value.map(tokenValueFor);
+  if (!value || typeof value !== "object") return value;
+  if (value.type === "VARIABLE_ALIAS" && typeof value.id === "string") {
+    return { alias: value.id };
+  }
+  if (Number.isFinite(value.r) && Number.isFinite(value.g) && Number.isFinite(value.b)) {
+    return {
+      r: clamp(value.r, 0, 1),
+      g: clamp(value.g, 0, 1),
+      b: clamp(value.b, 0, 1),
+      ...(Number.isFinite(value.a) ? { a: clamp(value.a, 0, 1) } : {}),
+    };
+  }
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([, item]) => item !== undefined && typeof item !== "function")
+      .map(([key, item]) => [key, tokenValueFor(item)]),
+  );
+}
+
+function layoutGridsToIR(grids) {
+  if (!Array.isArray(grids) || !grids.length) return undefined;
+  return grids.map((grid) => ({
+    ...(typeof grid.pattern === "string" ? { pattern: grid.pattern.toLowerCase() } : {}),
+    ...(Number.isFinite(grid.sectionSize) ? { sectionSize: grid.sectionSize } : {}),
+    ...(Number.isFinite(grid.gutterSize) ? { gutterSize: grid.gutterSize } : {}),
+    ...(Number.isFinite(grid.offset) ? { offset: grid.offset } : {}),
+    ...(typeof grid.alignment === "string" ? { alignment: grid.alignment.toLowerCase() } : {}),
+    ...(grid.color ? { color: tokenValueFor(grid.color) } : {}),
+  }));
+}
+
+async function readLocalList(owner, asyncName, syncName) {
+  if (owner && typeof owner[asyncName] === "function") {
+    try {
+      return await owner[asyncName]();
+    } catch (_error) {
+      // Fall through to the synchronous API for older/runtime-limited files.
+    }
+  }
+  if (owner && typeof owner[syncName] === "function") {
+    try {
+      return owner[syncName]();
+    } catch (_error) {
+      return [];
+    }
+  }
+  return [];
+}
+
+function styleTokenFor(style, source, type, value) {
+  if (!style || typeof style.id !== "string") return undefined;
+  return {
+    id: style.id,
+    name: nonEmptyString(style.name) || style.id,
+    type,
+    value: tokenValueFor(value),
+    ...(nonEmptyString(style.description) ? { description: style.description } : {}),
+    source,
+  };
+}
+
+async function tokenCatalog(options) {
+  if (!options.includeTokens) return [];
+  const key = figma.root.id;
+  if (tokenCache.has(key)) return tokenCache.get(key);
+  const promise = (async () => {
+    const variablesAPI = figma.variables || figma;
+    const [paintStyles, textStyles, effectStyles, gridStyles, collections, variables] = await Promise.all([
+      readLocalList(figma, "getLocalPaintStylesAsync", "getLocalPaintStyles"),
+      readLocalList(figma, "getLocalTextStylesAsync", "getLocalTextStyles"),
+      readLocalList(figma, "getLocalEffectStylesAsync", "getLocalEffectStyles"),
+      readLocalList(figma, "getLocalGridStylesAsync", "getLocalGridStyles"),
+      readLocalList(variablesAPI, "getLocalVariableCollectionsAsync", "getLocalVariableCollections"),
+      readLocalList(variablesAPI, "getLocalVariablesAsync", "getLocalVariables"),
+    ]);
+    const result = [];
+    paintStyles.forEach((style) => {
+      const token = styleTokenFor(style, "paint-style", "color", paintsToIR(style.paints));
+      if (token) result.push(token);
+    });
+    textStyles.forEach((style) => {
+      const token = styleTokenFor(style, "text-style", "typography", typographyFromValue(style));
+      if (token) result.push(token);
+    });
+    effectStyles.forEach((style) => {
+      const token = styleTokenFor(style, "effect-style", "effect", effectListToIR(style.effects));
+      if (token) result.push(token);
+    });
+    gridStyles.forEach((style) => {
+      const token = styleTokenFor(style, "grid-style", "grid", layoutGridsToIR(style.layoutGrids));
+      if (token) result.push(token);
+    });
+    const collectionById = new Map(
+      collections
+        .filter((collection) => collection && typeof collection.id === "string")
+        .map((collection) => [collection.id, collection]),
+    );
+    variables.forEach((variable) => {
+      if (!variable || typeof variable.id !== "string") return;
+      const collection = collectionById.get(variable.variableCollectionId);
+      const modes = Array.isArray(collection && collection.modes) ? collection.modes : [];
+      const valuesByMode = {};
+      modes.forEach((mode) => {
+        if (Object.prototype.hasOwnProperty.call(variable.valuesByMode || {}, mode.modeId)) {
+          valuesByMode[mode.name || mode.modeId] = tokenValueFor(variable.valuesByMode[mode.modeId]);
+        }
+      });
+      const defaultMode = modes.find((mode) => mode.modeId === (collection && collection.defaultModeId));
+      const defaultValue = defaultMode && Object.prototype.hasOwnProperty.call(valuesByMode, defaultMode.name || defaultMode.modeId)
+        ? valuesByMode[defaultMode.name || defaultMode.modeId]
+        : undefined;
+      const type = {
+        COLOR: "color",
+        FLOAT: "number",
+        STRING: "string",
+        BOOLEAN: "boolean",
+      }[variable.resolvedType] || "unknown";
+      result.push({
+        id: variable.id,
+        name: nonEmptyString(variable.name) || variable.id,
+        type,
+        ...(defaultValue !== undefined ? { value: defaultValue } : {}),
+        ...(Object.keys(valuesByMode).length ? { valuesByMode } : {}),
+        ...(collection && typeof collection.id === "string" ? { collectionId: collection.id } : {}),
+        ...(collection && nonEmptyString(collection.name) ? { collectionName: collection.name } : {}),
+        ...(modes.length ? { modes: modes.map((mode) => ({ id: mode.modeId, name: mode.name })) } : {}),
+        ...(nonEmptyString(variable.description) ? { description: variable.description } : {}),
+        ...(Array.isArray(variable.scopes) && variable.scopes.length ? { scopes: [...variable.scopes] } : {}),
+        ...(variable.codeSyntax && typeof variable.codeSyntax === "object" ? {
+          codeSyntax: Object.fromEntries(
+            Object.entries(variable.codeSyntax).filter(([, value]) => typeof value === "string"),
+          ),
+        } : {}),
+        source: "variable",
+      });
+    });
+    return result;
+  })();
+  tokenCache.set(key, promise);
+  try {
+    return await promise;
+  } catch (_error) {
+    tokenCache.delete(key);
+    return [];
+  }
 }
 
 function layoutFor(node, parentLayoutMode) {
@@ -467,16 +994,36 @@ function prototypeLinksFor(node) {
   if (!Array.isArray(node.reactions) || !node.reactions.length) return undefined;
   const links = [];
   node.reactions.forEach((reaction) => {
-    const trigger = reaction.trigger && reaction.trigger.type
-      ? String(reaction.trigger.type).toLowerCase()
+    const triggerObject = reaction.trigger || {};
+    const trigger = triggerObject.type
+      ? String(triggerObject.type).toLowerCase()
       : "unknown";
+    const triggerData = Object.fromEntries(
+      ["timeout", "delay", "device", "keyCodes", "mediaHitTime"]
+        .filter((key) => triggerObject[key] !== undefined)
+        .map((key) => [key, triggerObject[key]]),
+    );
     const actions = Array.isArray(reaction.actions)
       ? reaction.actions
       : reaction.action
         ? [reaction.action]
-        : [];
+      : [];
     actions.forEach((action) => {
       if (!action || typeof action.type !== "string") return;
+      const data = {
+        ...(Object.keys(triggerData).length ? { trigger: triggerData } : {}),
+        ...(action.transition && action.transition.easing && action.transition.easing.easingFunctionCubicBezier
+          ? { easingFunctionCubicBezier: action.transition.easing.easingFunctionCubicBezier }
+          : {}),
+        ...(action.transition && action.transition.easing && action.transition.easing.easingFunctionSpring
+          ? { easingFunctionSpring: action.transition.easing.easingFunctionSpring }
+          : {}),
+        ...(typeof action.variableId === "string" ? { variableId: action.variableId } : {}),
+        ...(typeof action.variableCollectionId === "string" ? { variableCollectionId: action.variableCollectionId } : {}),
+        ...(action.variableValue !== undefined ? { variableValue: tokenValueFor(action.variableValue) } : {}),
+        ...(Array.isArray(action.conditionalBlocks) ? { conditionalBlocks: action.conditionalBlocks } : {}),
+        ...(action.data && typeof action.data === "object" ? action.data : {}),
+      };
       links.push({
         trigger,
         action: action.type.toLowerCase(),
@@ -489,9 +1036,31 @@ function prototypeLinksFor(node) {
         ...(action.transition && Number.isFinite(action.transition.duration)
           ? { duration: Math.max(0, action.transition.duration) }
           : {}),
+        ...(action.transition && action.transition.easing && typeof action.transition.easing.type === "string"
+          ? { easing: action.transition.easing.type.toLowerCase() }
+          : {}),
+        ...(action.transition && typeof action.transition.direction === "string"
+          ? { direction: action.transition.direction.toLowerCase() }
+          : {}),
+        ...(action.transition && typeof action.transition.matchLayers === "boolean"
+          ? { matchLayers: action.transition.matchLayers }
+          : {}),
+        ...(action.overlayRelativePosition && Number.isFinite(action.overlayRelativePosition.x)
+          && Number.isFinite(action.overlayRelativePosition.y)
+          ? { overlayPosition: { x: action.overlayRelativePosition.x, y: action.overlayRelativePosition.y } }
+          : {}),
+        ...(typeof action.openInNewTab === "boolean" ? { openInNewTab: action.openInNewTab } : {}),
         ...(typeof action.preserveScrollPosition === "boolean"
           ? { preserveScrollPosition: action.preserveScrollPosition }
           : {}),
+        ...(typeof action.resetScrollPosition === "boolean"
+          ? { resetScrollPosition: action.resetScrollPosition }
+          : {}),
+        ...(typeof action.resetInteractiveComponents === "boolean"
+          ? { resetInteractiveComponents: action.resetInteractiveComponents }
+          : {}),
+        ...(typeof action.mediaAction === "string" ? { mediaAction: action.mediaAction.toLowerCase() } : {}),
+        ...(Object.keys(data).length ? { data } : {}),
       });
     });
   });
@@ -536,13 +1105,50 @@ function renderBoundsFor(node, layoutBounds) {
   return renderBounds;
 }
 
+function viewportFor(bounds) {
+  if (!bounds || bounds.width <= 0 || bounds.height <= 0) return undefined;
+  const orientation = bounds.width === bounds.height
+    ? "square"
+    : bounds.width > bounds.height
+      ? "landscape"
+      : "portrait";
+  const breakpoint = bounds.width < 600
+    ? "compact"
+    : bounds.width < 1024
+      ? "medium"
+      : "expanded";
+  return {
+    width: bounds.width,
+    height: bounds.height,
+    orientation,
+    breakpoint,
+  };
+}
+
+function screenDetailsFor(page) {
+  return childrenOf(page)
+    .filter((child) => child.type === "FRAME")
+    .map((child) => {
+      const bounds = boundsFor(child);
+      const viewport = viewportFor(bounds);
+      return viewport ? {
+        node: ref(child.id),
+        name: child.name || child.type,
+        viewport,
+      } : undefined;
+    })
+    .filter(Boolean);
+}
+
 async function nodeToIR(node, parentId, topLevel, exportState) {
   const children = childrenOf(node);
   const corners = cornersToIR(node);
   const bounds = boundsFor(node);
   const renderBounds = renderBoundsFor(node, bounds);
+  const transform = affineTransformFor(node.relativeTransform);
   const fills = Array.isArray(node.fills) && node.fills.length ? paintsToIR(node.fills) : undefined;
   const strokes = strokesToIR(node);
+  const effects = effectsToIR(node);
   const opacity = Number.isFinite(node.opacity) && node.opacity !== 1
     ? clamp(node.opacity, 0, 1)
     : undefined;
@@ -555,6 +1161,26 @@ async function nodeToIR(node, parentId, topLevel, exportState) {
     ? node.layoutGrow
     : undefined;
   const layoutPositioning = node.layoutPositioning === "ABSOLUTE" ? "absolute" : undefined;
+  const styleRefs = styleRefsFor(node);
+  const variableBindings = variableBindingsFor(node);
+  const component = componentFor(node);
+  const accessibility = accessibilityFor(node);
+  const annotations = annotationsFor(node);
+  const textSegments = textSegmentsFor(node);
+  const typography = typographyFor(node);
+  const layout = layoutFor(node, node.parent && node.parent.layoutMode);
+  const constraints = constraintsFor(node);
+  const gridPosition = gridPositionFor(node);
+  const prototypeLinks = prototypeLinksFor(node);
+  const description = nonEmptyString(node.description);
+  const asset = await assetFor(node, exportState);
+  const devStatus = safeRead(() => node.devStatus, null);
+  const hostData = {
+    figmaType: node.type,
+    topLevel: Boolean(topLevel),
+    ...(safeRead(() => node.isAsset, false) === true ? { isAsset: true } : {}),
+    ...(devStatus ? { devStatus } : {}),
+  };
   const result = {
     id: node.id,
     name: node.name || node.type,
@@ -564,34 +1190,40 @@ async function nodeToIR(node, parentId, topLevel, exportState) {
     bounds,
     ...(renderBounds ? { renderBounds } : {}),
     visible: node.visible !== false,
+    ...(typeof node.locked === "boolean" && node.locked ? { locked: true } : {}),
+    ...(description ? { description } : {}),
     ...(opacity !== undefined ? { opacity } : {}),
     ...(blendModeFor(node.blendMode) ? { blendMode: blendModeFor(node.blendMode) } : {}),
     ...(fills ? { fills } : {}),
     ...(strokes ? { strokes } : {}),
-    effects: effectsToIR(node),
+    ...(effects ? { effects } : {}),
     ...corners,
-    asset: await assetFor(node, exportState),
+    ...(asset ? { asset } : {}),
     ...(rotation !== undefined ? { rotation } : {}),
+    ...(transform ? { transform } : {}),
     ...(clipsContent ? { clipsContent } : {}),
-    minWidth: Number.isFinite(node.minWidth) ? Math.max(0, node.minWidth) : undefined,
-    maxWidth: Number.isFinite(node.maxWidth) ? Math.max(0, node.maxWidth) : undefined,
-    minHeight: Number.isFinite(node.minHeight) ? Math.max(0, node.minHeight) : undefined,
-    maxHeight: Number.isFinite(node.maxHeight) ? Math.max(0, node.maxHeight) : undefined,
-    constraints: constraintsFor(node),
+    ...(Number.isFinite(node.minWidth) ? { minWidth: Math.max(0, node.minWidth) } : {}),
+    ...(Number.isFinite(node.maxWidth) ? { maxWidth: Math.max(0, node.maxWidth) } : {}),
+    ...(Number.isFinite(node.minHeight) ? { minHeight: Math.max(0, node.minHeight) } : {}),
+    ...(Number.isFinite(node.maxHeight) ? { maxHeight: Math.max(0, node.maxHeight) } : {}),
+    ...(constraints ? { constraints } : {}),
     ...(layoutAlign ? { layoutAlign } : {}),
     ...(layoutGrow !== undefined ? { layoutGrow } : {}),
     ...(layoutPositioning ? { layoutPositioning } : {}),
-    gridPosition: gridPositionFor(node),
-    text: node.type === "TEXT" ? node.characters : undefined,
-    typography: typographyFor(node),
-    layout: layoutFor(node, node.parent && node.parent.layoutMode),
-    prototypeLinks: prototypeLinksFor(node),
-    hostData: {
-      figmaType: node.type,
-      topLevel: Boolean(topLevel),
-    },
+    ...(gridPosition ? { gridPosition } : {}),
+    ...(styleRefs ? { styleRefs } : {}),
+    ...(variableBindings ? { variableBindings } : {}),
+    ...(component ? { component } : {}),
+    ...(accessibility ? { accessibility } : {}),
+    ...(annotations ? { annotations } : {}),
+    ...(node.type === "TEXT" ? { text: node.characters } : {}),
+    ...(textSegments ? { textSegments } : {}),
+    ...(typography ? { typography } : {}),
+    ...(layout ? { layout } : {}),
+    ...(prototypeLinks ? { prototypeLinks } : {}),
+    hostData,
   };
-  return { result, children };
+  return result;
 }
 
 function documentInfo() {
@@ -605,12 +1237,55 @@ function selectionItems() {
   return figma.currentPage.selection || [];
 }
 
-async function buildDocumentIR() {
+function flattenSubtree(node, parentId, topLevel, entries) {
+  entries.push({ node, parentId, topLevel });
+  childrenOf(node).forEach((child) => flattenSubtree(
+    child,
+    node.id,
+    node.type === "PAGE" && child.type === "FRAME",
+    entries,
+  ));
+}
+
+async function serializeEntries(entries, options) {
+  const start = options.nodeOffset;
+  const selected = entries.slice(start, start + options.maxNodes);
+  const exportState = exportStateFor(options);
+  const nodes = [];
+  for (const entry of selected) {
+    nodes.push(await nodeToIR(entry.node, entry.parentId, entry.topLevel, exportState));
+  }
+  const hasMore = start + nodes.length < entries.length;
+  return {
+    nodes,
+    pagination: {
+      offset: start,
+      limit: options.maxNodes,
+      total: entries.length,
+      returned: nodes.length,
+      hasMore,
+      ...(hasMore ? { nextOffset: start + nodes.length } : {}),
+    },
+    exportStats: {
+      totalNodes: entries.length,
+      returnedNodes: nodes.length,
+      assetCount: exportState.assetCount,
+      assetBytes: exportState.assetBytes,
+      assetsOmitted: exportState.assetsOmitted,
+      tokenCount: 0,
+    },
+  };
+}
+
+async function buildDocumentIR(options) {
   const page = figma.currentPage;
+  const entries = [];
+  flattenSubtree(page, null, true, entries);
+  const tokens = await tokenCatalog(options);
+  const serialized = await serializeEntries(entries, options);
+  const screenDetails = screenDetailsFor(page);
   const nodes = {};
-  const exportState = { assetExports: 0 };
-  const flattened = await collectSubtree(page, null, true, exportState);
-  flattened.forEach((node) => {
+  serialized.nodes.forEach((node) => {
     nodes[node.id] = node;
   });
   const info = documentInfo();
@@ -626,26 +1301,21 @@ async function buildDocumentIR() {
     nodes,
     screens,
     selection: selectionItems().map((item) => ref(item.id)),
+    ...(tokens.length ? { tokens } : {}),
+    ...(screenDetails.length ? { screenDetails } : {}),
+    pagination: serialized.pagination,
+    exportStats: { ...serialized.exportStats, tokenCount: tokens.length },
     exportedAt: new Date().toISOString(),
   };
 }
 
-async function collectSubtree(node, parentId, topLevel, exportState) {
-  const converted = await nodeToIR(node, parentId, topLevel, exportState);
-  const childNodes = await Promise.all(
-    converted.children.map((child) => collectSubtree(child, converted.result.id, false, exportState)),
-  );
-  return [converted.result, ...childNodes.flat()];
-}
-
-async function selectionContext() {
+async function selectionContext(options) {
   const info = documentInfo();
   const selection = selectionItems();
-  const exportState = { assetExports: 0 };
-  const nodeLists = await Promise.all(
-    selection.map((item) => collectSubtree(item, item.parent && item.parent.id, item.parent === figma.currentPage, exportState)),
-  );
-  const nodes = nodeLists.flat();
+  const entries = [];
+  selection.forEach((item) => flattenSubtree(item, item.parent && item.parent.id, item.parent === figma.currentPage, entries));
+  const tokens = await tokenCatalog(options);
+  const serialized = await serializeEntries(entries, options);
   return {
     schemaVersion: 1,
     scope: "selection",
@@ -653,7 +1323,10 @@ async function selectionContext() {
     documentId: info.documentId,
     documentName: info.documentName,
     selection: selection.map((item) => ref(item.id)),
-    nodes,
+    nodes: serialized.nodes,
+    ...(tokens.length ? { tokens } : {}),
+    pagination: serialized.pagination,
+    exportStats: { ...serialized.exportStats, tokenCount: tokens.length },
     exportedAt: new Date().toISOString(),
   };
 }
@@ -667,13 +1340,16 @@ function findScreen(screenId) {
   return selected || figma.currentPage.children.find((child) => child.type === "FRAME") || null;
 }
 
-async function screenContext(screenId) {
+async function screenContext(screenId, options) {
   const screen = findScreen(screenId);
   if (!screen) throw new Error("No Figma screen frame was found for the requested screen");
   const info = documentInfo();
-  const exportState = { assetExports: 0 };
-  const nodes = await collectSubtree(screen, screen.parent && screen.parent.id, true, exportState);
+  const entries = [];
+  flattenSubtree(screen, screen.parent && screen.parent.id, true, entries);
+  const tokens = await tokenCatalog(options);
+  const serialized = await serializeEntries(entries, options);
   const selection = selectionItems();
+  const viewport = viewportFor(boundsFor(screen));
   return {
     schemaVersion: 1,
     scope: "screen",
@@ -682,7 +1358,11 @@ async function screenContext(screenId) {
     documentName: info.documentName,
     screenId: screen.id,
     selection: selection.map((item) => ref(item.id)),
-    nodes,
+    ...(viewport ? { viewport } : {}),
+    nodes: serialized.nodes,
+    ...(tokens.length ? { tokens } : {}),
+    pagination: serialized.pagination,
+    exportStats: { ...serialized.exportStats, tokenCount: tokens.length },
     exportedAt: new Date().toISOString(),
   };
 }
@@ -836,10 +1516,13 @@ async function handleRequest(request) {
         result = CAPABILITIES;
         break;
       case "get_selection_context":
-        result = await selectionContext();
+        result = await selectionContext(exportOptionsFor(request.payload));
         break;
       case "get_screen_context":
-        result = await screenContext(request.payload && request.payload.screenId);
+        result = await screenContext(
+          request.payload && request.payload.screenId,
+          exportOptionsFor(request.payload),
+        );
         break;
       case "get_visual_context":
         result = await visualContext(
@@ -849,11 +1532,12 @@ async function handleRequest(request) {
         break;
       case "export_ir": {
         const scope = (request.payload && request.payload.scope) || "document";
+        const options = exportOptionsFor(request.payload);
         result = scope === "selection"
-          ? await selectionContext()
+          ? await selectionContext(options)
           : scope === "screen"
-            ? await screenContext(request.payload && request.payload.screenId)
-            : await buildDocumentIR();
+            ? await screenContext(request.payload && request.payload.screenId, options)
+            : await buildDocumentIR(options);
         break;
       }
       case "create_screen":
@@ -881,7 +1565,12 @@ figma.ui.onmessage = (message) => {
 };
 
 figma.on("selectionchange", () => {
-  void selectionContext()
+  void selectionContext({
+    ...DEFAULT_EXPORT_OPTIONS,
+    maxNodes: 500,
+    includeAssets: false,
+    includeTokens: false,
+  })
     .then((payload) => {
       sendToUI({
         type: "bridge_event",
@@ -903,4 +1592,5 @@ figma.on("selectionchange", () => {
 figma.on("documentchange", () => {
   assetCache.clear();
   assetPromises.clear();
+  tokenCache.clear();
 });

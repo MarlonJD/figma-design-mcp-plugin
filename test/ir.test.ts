@@ -2,7 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   contextIRSchema,
+  designAssetSchema,
   designIRSchema,
+  exportOptionsSchema,
   screenSpecSchema,
   visualContextSchema,
 } from "../src/core/ir.js";
@@ -11,6 +13,26 @@ test("screen specs receive safe defaults", () => {
   const spec = screenSpecSchema.parse({ name: "Audit overview" });
   assert.equal(spec.width, 1440);
   assert.equal(spec.height, 900);
+});
+
+test("export options are bounded and asset metadata is explicit", () => {
+  const options = exportOptionsSchema.parse({ includeAssets: false, maxNodes: 25 });
+  assert.deepEqual(options, {
+    maxNodes: 25,
+    nodeOffset: 0,
+    includeAssets: false,
+    maxAssetBytes: 4000000,
+    includeTokens: true,
+  });
+  assert.throws(() => exportOptionsSchema.parse({ maxNodes: 10001 }));
+
+  const asset = designAssetSchema.parse({
+    mimeType: "image/svg+xml",
+    data: "<svg />",
+    kind: "vector",
+    byteSize: 7,
+  });
+  assert.equal(asset.byteSize, 7);
 });
 
 test("DesignIR and context IR reject host-specific shape drift", () => {
@@ -135,6 +157,7 @@ test("DesignIR preserves the evidence needed for semantic reconstruction", () =>
     cornerRadii: { topLeft: 16, topRight: 16, bottomRight: 12, bottomLeft: 12 },
     asset: { mimeType: "image/svg+xml", data: "<svg />", kind: "vector" as const },
     rotation: 0,
+    transform: { a: 1, b: 0, c: 0, d: 1, tx: 24, ty: 32 },
     clipsContent: true,
     minWidth: 240,
     maxWidth: 640,
@@ -202,6 +225,7 @@ test("DesignIR preserves the evidence needed for semantic reconstruction", () =>
 
   const parsed = context.nodes[0]!;
   assert.equal(parsed.renderBounds?.width, 324);
+  assert.equal(parsed.transform?.tx, 24);
   assert.equal(parsed.fills?.[0]?.gradientTransform?.tx, 0);
   assert.equal(parsed.strokes?.[0]?.sideWeights?.right, 2);
   assert.equal(parsed.effects?.[0]?.offset?.y, 8);
@@ -209,6 +233,69 @@ test("DesignIR preserves the evidence needed for semantic reconstruction", () =>
   assert.equal(parsed.layout?.grid?.columns, 2);
   assert.equal(parsed.typography?.maxLines, 2);
   assert.equal(parsed.prototypeLinks?.[0]?.navigation, "navigate");
+});
+
+test("DesignIR carries token, component state, accessibility, and export evidence", () => {
+  const ir = designIRSchema.parse({
+    schemaVersion: 1,
+    host: "figma",
+    documentId: "doc-evidence",
+    documentName: "Evidence",
+    rootId: "root",
+    nodes: {
+      root: {
+        id: "root",
+        name: "Root",
+        kind: "root",
+        parentId: null,
+        children: [],
+        bounds: null,
+        visible: true,
+        component: {
+          id: "component-1",
+          variantProperties: { State: "Hover", Size: "Large" },
+          states: { State: "Hover" },
+          properties: [{ key: "label#text", name: "label", type: "text", value: "Continue" }],
+          isVariant: true,
+        },
+        accessibility: {
+          role: "button",
+          label: "Continue",
+          source: "explicit",
+          confidence: 1,
+        },
+      },
+    },
+    screens: [],
+    selection: [],
+    tokens: [{
+      id: "token-1",
+      name: "color/action/primary",
+      type: "color",
+      value: { r: 0.1, g: 0.2, b: 0.3 },
+      source: "variable",
+    }],
+    pagination: {
+      offset: 0,
+      limit: 1,
+      total: 1,
+      returned: 1,
+      hasMore: false,
+    },
+    exportStats: {
+      totalNodes: 1,
+      returnedNodes: 1,
+      assetCount: 0,
+      assetBytes: 0,
+      assetsOmitted: 0,
+      tokenCount: 1,
+    },
+    exportedAt: new Date().toISOString(),
+  });
+  assert.equal(ir.tokens?.[0]?.name, "color/action/primary");
+  assert.equal(ir.nodes.root?.component?.states?.State, "Hover");
+  assert.equal(ir.nodes.root?.accessibility?.role, "button");
+  assert.equal(ir.exportStats?.tokenCount, 1);
 });
 
 test("visual context keeps image data separate from node properties", () => {

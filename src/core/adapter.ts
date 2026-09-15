@@ -10,7 +10,9 @@ import {
   type DesignPatch,
   type HostCapabilities,
   type HostKind,
+  type ExportOptions,
   type VisualContext,
+  exportOptionsSchema,
   screenSpecSchema,
   type ScreenSpec,
   visualContextSchema,
@@ -20,13 +22,21 @@ import { DesignPortBridge } from "../bridge/bridge-server.js";
 export interface DesignHostAdapter {
   readonly host: HostKind;
   getCapabilities(): Promise<HostCapabilities>;
-  getSelectionContext(): Promise<ContextIR>;
-  getScreenContext(screenId?: string): Promise<ContextIR>;
+  getSelectionContext(options?: Partial<ExportOptions>): Promise<ContextIR>;
+  getScreenContext(screenId?: string, options?: Partial<ExportOptions>): Promise<ContextIR>;
   getVisualContext(scope: "selection" | "screen", screenId?: string): Promise<VisualContext>;
-  exportIR(scope: "document" | "selection" | "screen", screenId?: string): Promise<DesignIR | ContextIR>;
+  exportIR(
+    scope: "document" | "selection" | "screen",
+    screenId?: string,
+    options?: Partial<ExportOptions>,
+  ): Promise<DesignIR | ContextIR>;
   createScreen(spec: ScreenSpec): Promise<unknown>;
   createComponent(spec: ComponentSpec): Promise<unknown>;
   updateSelection(patch: DesignPatch): Promise<unknown>;
+}
+
+function optionsPayload(options?: Partial<ExportOptions>): { options: ExportOptions } {
+  return { options: exportOptionsSchema.parse(options ?? {}) };
 }
 
 export class BridgeHostAdapter implements DesignHostAdapter {
@@ -41,14 +51,17 @@ export class BridgeHostAdapter implements DesignHostAdapter {
     );
   }
 
-  async getSelectionContext(): Promise<ContextIR> {
+  async getSelectionContext(options?: Partial<ExportOptions>): Promise<ContextIR> {
     return contextIRSchema.parse(
-      await this.bridge.request(this.host, "get_selection_context", {}),
+      await this.bridge.request(this.host, "get_selection_context", optionsPayload(options)),
     );
   }
 
-  async getScreenContext(screenId?: string): Promise<ContextIR> {
-    const payload = screenId ? { screenId } : {};
+  async getScreenContext(screenId?: string, options?: Partial<ExportOptions>): Promise<ContextIR> {
+    const payload = {
+      ...(screenId ? { screenId } : {}),
+      ...optionsPayload(options),
+    };
     return contextIRSchema.parse(
       await this.bridge.request(this.host, "get_screen_context", payload),
     );
@@ -70,8 +83,13 @@ export class BridgeHostAdapter implements DesignHostAdapter {
   async exportIR(
     scope: "document" | "selection" | "screen",
     screenId?: string,
+    options?: Partial<ExportOptions>,
   ): Promise<DesignIR | ContextIR> {
-    const payload = screenId ? { scope, screenId } : { scope };
+    const payload = {
+      scope,
+      ...(screenId ? { screenId } : {}),
+      ...optionsPayload(options),
+    };
     const result = await this.bridge.request(this.host, "export_ir", payload);
     return scope === "document" ? designIRSchema.parse(result) : contextIRSchema.parse(result);
   }

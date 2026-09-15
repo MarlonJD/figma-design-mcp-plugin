@@ -32,6 +32,12 @@ links when the document exposes them. It can also create basic
 screens/components and apply supported selection patches. Figma writes are
 applied immediately by the plugin.
 
+The export also includes local variables/styles as `tokens`, node style and
+variable bindings, mixed text style ranges, component properties and variant
+state values, accessibility/annotation metadata, and interaction details. A
+request can set `maxNodes`, `nodeOffset`, `includeAssets`, `maxAssetBytes`, and
+`includeTokens`; the response reports `pagination` and `exportStats`.
+
 Asset data is embedded only for visible vector and image-painted nodes. If a
 host export fails, the structural node remains available and the missing
 asset is not replaced with a guessed shape.

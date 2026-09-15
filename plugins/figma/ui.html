@@ -1,0 +1,70 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      html, body { margin: 0; padding: 0; width: 1px; height: 1px; overflow: hidden; }
+    </style>
+  </head>
+  <body>
+    <script>
+      const BRIDGE_URL = "ws://localhost:5514";
+      let socket = null;
+      let hello = null;
+      let reconnectTimer = null;
+
+      function sendToPlugin(message) {
+        parent.postMessage({ pluginMessage: message }, "*");
+      }
+
+      function connect() {
+        if (!hello || (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING))) {
+          return;
+        }
+        socket = new WebSocket(BRIDGE_URL);
+        socket.onopen = () => {
+          socket.send(JSON.stringify(hello));
+          sendToPlugin({ type: "bridge_status", status: "connected" });
+        };
+        socket.onmessage = (event) => {
+          try {
+            const message = JSON.parse(event.data);
+            if (message.type === "request") {
+              sendToPlugin({ type: "bridge_request", request: message });
+            }
+          } catch (error) {
+            sendToPlugin({ type: "bridge_status", status: "invalid_message", message: String(error) });
+          }
+        };
+        socket.onerror = () => sendToPlugin({ type: "bridge_status", status: "error" });
+        socket.onclose = () => {
+          socket = null;
+          sendToPlugin({ type: "bridge_status", status: "disconnected" });
+          if (!reconnectTimer) {
+            reconnectTimer = setTimeout(() => {
+              reconnectTimer = null;
+              connect();
+            }, 2500);
+          }
+        };
+      }
+
+      window.onmessage = (event) => {
+        const message = event.data && event.data.pluginMessage;
+        if (!message) return;
+        if (message.type === "host_hello") {
+          hello = message.hello;
+          connect();
+          return;
+        }
+        if (message.type === "bridge_response" || message.type === "bridge_event") {
+          if (socket && socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify(message.value));
+          }
+        }
+      };
+
+      parent.postMessage({ pluginMessage: { type: "ui_ready" } }, "*");
+    </script>
+  </body>
+</html>

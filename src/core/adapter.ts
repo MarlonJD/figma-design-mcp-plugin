@@ -1,0 +1,76 @@
+import {
+  componentSpecSchema,
+  contextIRSchema,
+  designIRSchema,
+  designPatchSchema,
+  hostCapabilitiesSchema,
+  type ComponentSpec,
+  type ContextIR,
+  type DesignIR,
+  type DesignPatch,
+  type HostCapabilities,
+  type HostKind,
+  screenSpecSchema,
+  type ScreenSpec,
+} from "./ir.js";
+import { DesignPortBridge } from "../bridge/bridge-server.js";
+
+export interface DesignHostAdapter {
+  readonly host: HostKind;
+  getCapabilities(): Promise<HostCapabilities>;
+  getSelectionContext(): Promise<ContextIR>;
+  getScreenContext(screenId?: string): Promise<ContextIR>;
+  exportIR(scope: "document" | "selection" | "screen", screenId?: string): Promise<DesignIR | ContextIR>;
+  createScreen(spec: ScreenSpec): Promise<unknown>;
+  createComponent(spec: ComponentSpec): Promise<unknown>;
+  updateSelection(patch: DesignPatch): Promise<unknown>;
+}
+
+export class BridgeHostAdapter implements DesignHostAdapter {
+  constructor(
+    private readonly bridge: DesignPortBridge,
+    readonly host: HostKind,
+  ) {}
+
+  async getCapabilities(): Promise<HostCapabilities> {
+    return hostCapabilitiesSchema.parse(
+      await this.bridge.request(this.host, "get_capabilities", {}),
+    );
+  }
+
+  async getSelectionContext(): Promise<ContextIR> {
+    return contextIRSchema.parse(
+      await this.bridge.request(this.host, "get_selection_context", {}),
+    );
+  }
+
+  async getScreenContext(screenId?: string): Promise<ContextIR> {
+    const payload = screenId ? { screenId } : {};
+    return contextIRSchema.parse(
+      await this.bridge.request(this.host, "get_screen_context", payload),
+    );
+  }
+
+  async exportIR(
+    scope: "document" | "selection" | "screen",
+    screenId?: string,
+  ): Promise<DesignIR | ContextIR> {
+    const payload = screenId ? { scope, screenId } : { scope };
+    const result = await this.bridge.request(this.host, "export_ir", payload);
+    return scope === "document" ? designIRSchema.parse(result) : contextIRSchema.parse(result);
+  }
+
+  async createScreen(spec: ScreenSpec): Promise<unknown> {
+    return this.bridge.request(this.host, "create_screen", screenSpecSchema.parse(spec));
+  }
+
+  async createComponent(spec: ComponentSpec): Promise<unknown> {
+    return this.bridge.request(this.host, "create_component", componentSpecSchema.parse(spec));
+  }
+
+  async updateSelection(patch: DesignPatch): Promise<unknown> {
+    return this.bridge.request(this.host, "update_selection", {
+      patch: designPatchSchema.parse(patch),
+    });
+  }
+}

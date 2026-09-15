@@ -228,13 +228,11 @@ template and scoped styles.
 ```
 
 The result contains `design_port_screen.dart` with a `DesignPortApp` entry point
-and a `DesignPortScreen` `StatelessWidget`. It uses the official standalone
-`cupertino_ui` package (Flutter 3.47+, currently `1.0.2`), not SwiftUI or
-Material. Add the dependency before importing the generated file:
-
-```bash
-flutter add cupertino_ui
-```
+and a `DesignPortScreen` `StatelessWidget`. It imports only
+`package:flutter/widgets.dart`, so it has no Material or Cupertino package
+dependency. The output uses the SDK's style-neutral core widgets and keeps
+layout semantics explicit: `Row`/`Column`/`Wrap`, `Expanded`/`Flexible`,
+`SizedBox`, `Stack`, and accessible `Semantics` actions.
 
 Auto-layout rows and columns become `Row`/`Column`; fill-sized siblings become
 `Expanded`, and hug-sized siblings become `Flexible`.

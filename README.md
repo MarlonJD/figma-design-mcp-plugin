@@ -109,7 +109,7 @@ have to reconstruct basic flex behavior from pixels alone.
 | `html` | `designport-export.html` | A self-contained browser preview. |
 | `react` | `DesignPortScreen.tsx`, `DesignPortScreen.css` | React application starter. |
 | `vue` | `DesignPortScreen.vue` | Vue single-file component starter. |
-| `flutter` | `design_port_screen.dart` | Flutter widget starter. |
+| `flutter` | `design_port_screen.dart` | Flutter core-widget starter with no design-system package dependency. |
 | `swiftui` | `DesignPortScreen.swift` | SwiftUI view starter. |
 | `compose` | `DesignPortScreen.kt` | Jetpack Compose composable starter. |
 
@@ -135,10 +135,10 @@ The same layout plan maps to the native primitive for each target:
 | Fill remaining space | `flex: 1 1 0` | `Expanded` | `frame(maxWidth/maxHeight: .infinity)` | `weight(1f)` |
 | Grid-like flow | CSS grid | `Wrap` | `LazyVGrid` | rows of weighted `Row`s |
 
-Current native UI baselines are intentionally modern: Flutter uses the
-official `cupertino_ui` package, SwiftUI emits iOS 26+/macOS 26+ Liquid Glass
-APIs with a fallback, and Compose uses the latest stable Material 3 dependency
-with dynamic color and `Scaffold`.
+Current native UI baselines are intentionally modern: Flutter uses the SDK's
+style-neutral `widgets.dart` library with semantic flex primitives, SwiftUI
+emits iOS 26+/macOS 26+ Liquid Glass APIs with a fallback, and Compose uses the
+latest stable Material 3 dependency with dynamic color and `Scaffold`.
 
 ## Requirements
 

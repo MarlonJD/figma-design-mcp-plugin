@@ -176,7 +176,13 @@ test("layout metadata becomes responsive flow primitives across targets", () => 
   const flutter = generateCode(flowSnapshot, "flutter");
   assert.match(flutter.files["design_port_screen.dart"] ?? "", /Row\(/);
   assert.match(flutter.files["design_port_screen.dart"] ?? "", /Expanded\(/);
-  assert.match(flutter.files["design_port_screen.dart"] ?? "", /CupertinoButton\.filled/);
+  assert.match(flutter.files["design_port_screen.dart"] ?? "", /package:flutter\/widgets\.dart/);
+  assert.match(flutter.files["design_port_screen.dart"] ?? "", /WidgetsApp\(/);
+  assert.match(flutter.files["design_port_screen.dart"] ?? "", /Semantics\(button: true/);
+  assert.doesNotMatch(
+    flutter.files["design_port_screen.dart"] ?? "",
+    /dart:ui|flutter\/(material|cupertino)\.dart|material_ui|cupertino_ui|MaterialApp|Scaffold|Cupertino/,
+  );
 
   const swiftui = generateCode(flowSnapshot, "swiftui");
   assert.match(swiftui.files["DesignPortScreen.swift"] ?? "", /HStack\(/);

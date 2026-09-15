@@ -226,7 +226,7 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
     "design.generate_code",
     {
       title: "Generate application code",
-      description: "Export DesignIR from a host and generate a semantic starter implementation for web, React, Vue, Flutter Cupertino, SwiftUI, or Jetpack Compose. Layout metadata maps to flex, Row/Column, stacks, and fill-sized children where possible.",
+      description: "Export DesignIR from a host and generate a semantic starter implementation for web, React, Vue, Flutter core widgets, SwiftUI, or Jetpack Compose. Layout metadata maps to flex, Row/Column, stacks, and fill-sized children where possible.",
       inputSchema: generateCodeInput.shape,
     },
     async ({ host, scope, screenId, target }) => {

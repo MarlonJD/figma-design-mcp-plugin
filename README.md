@@ -3,11 +3,11 @@
 DesignPort is a local MCP bridge that lets coding agents understand and work
 with designs in Figma and Adobe XD.
 
-It gives an agent structured design context instead of making the agent guess
-from screenshots. A designer can keep working in the tool they know, while an
-agent can read selections and screens, export a host-neutral design model, and
-generate a starting point for web, React, Vue, Flutter, SwiftUI, or Jetpack
-Compose.
+It gives an agent both the visual reference and the structured design context
+needed to implement a screen. A designer can keep working in the tool they
+know, while an agent can read selections and screens, render them as PNG
+context, export a host-neutral design model, and generate a starting point for
+web, React, Vue, Flutter, SwiftUI, or Jetpack Compose.
 
 DesignPort is an early, local-first project. It is intentionally small enough
 to run on a designer's computer and clear enough to extend with more hosts and
@@ -16,17 +16,17 @@ code-generation targets.
 ## Why does this exist?
 
 Design files contain valuable implementation decisions: hierarchy, spacing,
-typography, colors, component boundaries, and screen relationships. Those
-decisions are difficult for an agent to recover reliably when the only input is
-a screenshot or a host-specific API dump.
+typography, colors, component boundaries, and screen relationships. A
+screenshot alone hides those decisions; a host-specific API dump hides the
+visual result. DesignPort keeps both evidence types together.
 
 DesignPort separates the problem into three parts:
 
-1. A Figma or XD development plugin reads the open document.
-2. The local bridge normalizes that information into `DesignIR`, a shared
-   design representation.
-3. MCP tools make the context available to coding agents and expose carefully
-   scoped design operations.
+1. A Figma or XD development plugin reads and renders the open document.
+2. The local bridge normalizes the document into `DesignIR`, a shared design
+   representation, and carries PNG previews when requested.
+3. MCP tools make properties, visual context, generated code, and carefully
+   scoped design operations available to coding agents.
 
 The result is a common path from design to implementation:
 
@@ -37,12 +37,12 @@ Figma / Adobe XD
         v
 DesignPort bridge + MCP server
         |
-        | DesignIR
+        | properties + visual + generated code
         v
 Codex / Claude / another MCP client
         |
         v
-HTML / React / future targets
+HTML / React / Vue / Flutter / SwiftUI / Compose
 ```
 
 The shared model is the important part. Figma-specific and XD-specific details
@@ -53,12 +53,14 @@ integration.
 
 - Connect a Figma development plugin and an Adobe XD UXP development plugin.
 - Read the current selection or a screen/artboard.
+- Render the current selection or a screen/artboard as PNG visual context.
 - Export a full document or a scoped `DesignIR` snapshot.
 - Report connected hosts, capabilities, and recent host events.
 - Generate a web export, a self-contained HTML export, or starter code for
   React, Vue, Flutter, SwiftUI, and Jetpack Compose.
 - Create screens and basic components through host adapters.
 - Apply a normalized patch to the current selection.
+- Return properties, visual context, and target code together for agent review.
 - Keep the bridge on loopback (`127.0.0.1`) by default.
 
 The available MCP tools are:
@@ -70,8 +72,10 @@ The available MCP tools are:
 | `design.get_capabilities` | Inspect what a connected host supports. |
 | `design.get_selection_context` | Read the current selection as normalized nodes. |
 | `design.get_screen_context` | Read one screen/artboard and its descendants. |
+| `design.get_visual_context` | Render a selection or screen as PNG image content. |
 | `design.export_ir` | Export document, selection, or screen context. |
 | `design.generate_code` | Generate web, HTML, React, Vue, Flutter, SwiftUI, or Compose code. |
+| `design.get_design_context` | Return properties, visual PNG, and generated code together. |
 | `design.create_screen` | Create an artboard/screen. |
 | `design.create_component` | Create a basic component or symbol where supported. |
 | `design.update_selection` | Apply a normalized patch to the current selection. |
@@ -79,6 +83,23 @@ The available MCP tools are:
 
 See [EXAMPLES.md](EXAMPLES.md) for ready-to-copy tool arguments and common
 workflows.
+
+### What the MCP gives the agent
+
+`design.get_design_context` is the normal implementation entry point. Its
+response contains three complementary layers:
+
+1. `properties`: the scoped `DesignIR` data — hierarchy, node kinds, bounds,
+   fills, typography, and layout metadata.
+2. A PNG image content block: the visual truth of the selected screen or
+   component.
+3. The requested target code as one text block per generated file.
+
+The MCP server does not replace the reasoning model. DesignPort supplies
+evidence; the LLM decides component boundaries, behavior, accessibility, and
+whether a layout should be a row, column, grid, or stack. The deterministic
+generator provides a consistent semantic first pass so the model does not
+have to reconstruct basic flex behavior from pixels alone.
 
 ### Code generation targets
 
@@ -221,12 +242,18 @@ must be applied from the panel inside a user-initiated edit context.
 
 With the bridge and one plugin connected, ask the MCP client to:
 
-1. Call `design.get_selection_context` for the selected design.
-2. Call `design.get_screen_context` for the selected screen/artboard.
-3. Call `design.generate_code` with `target: "react"` or one of the native
-   targets for a first-pass implementation.
+1. Call `design.get_design_context` with `target: "react"` for the selected
+   screen/artboard.
+2. Compare the returned PNG with `properties.nodes` and its layout metadata.
+3. Ask the LLM to replace pixel-only placement with semantic primitives where
+   the structure supports it, such as flex, `Row`/`Column`, `HStack`/`VStack`,
+   or Compose `Row`/`Column`.
 4. Use the generated output as a starting point, then refine behavior and
    accessibility in application code.
+
+Use `design.get_selection_context`, `design.get_screen_context`, and
+`design.generate_code` separately when you want smaller responses or a
+different stage of the workflow.
 
 The generator is deliberately a starter generator. It preserves useful layout
 semantics, geometry, fills, typography, and hierarchy, but it is not a promise

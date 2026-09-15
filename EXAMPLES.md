@@ -60,6 +60,45 @@ previous context/export call:
 The same call works for XD by changing `host` to `"xd"` and using an XD node
 ID.
 
+## Read the visual context
+
+Render the same screen as PNG image content. The response includes image
+content plus node metadata such as the node ID, name, bounds, and scale:
+
+```json
+{
+  "tool": "design.get_visual_context",
+  "arguments": {
+    "host": "figma",
+    "scope": "screen",
+    "screenId": "SCREEN_ID_FROM_CONTEXT"
+  }
+}
+```
+
+## Read properties, visual, and code together
+
+Use the aggregate tool when an agent needs the complete implementation
+context in one MCP response. It returns the scoped `DesignIR` properties, a
+PNG image block, and the generated files for the selected target:
+
+```json
+{
+  "tool": "design.get_design_context",
+  "arguments": {
+    "host": "figma",
+    "scope": "screen",
+    "screenId": "SCREEN_ID_FROM_CONTEXT",
+    "target": "react",
+    "includeVisual": true
+  }
+}
+```
+
+This is the recommended input for an LLM. The model can compare the visual
+result with the hierarchy and layout metadata, then improve the generated
+implementation without treating pixel coordinates as the layout model.
+
 ## Export the shared DesignIR
 
 Export a whole document:

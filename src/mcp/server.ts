@@ -6,6 +6,7 @@ import {
   screenSpecSchema,
   hostKindSchema,
   type HostKind,
+  visualContextSchema,
 } from "../core/ir.js";
 import { asDesignPortError, DesignPortError } from "../core/errors.js";
 import { DesignPortBridge } from "../bridge/bridge-server.js";
@@ -42,6 +43,16 @@ const generateCodeInput = exportInput.extend({
   target: z.enum(["html", "web", "react", "vue", "flutter", "swiftui", "compose"]).default("web"),
 });
 
+const visualInput = hostInput.extend({
+  scope: z.enum(["selection", "screen"]).default("screen"),
+  screenId: z.string().min(1).optional(),
+});
+
+const designContextInput = visualInput.extend({
+  target: z.enum(["html", "web", "react", "vue", "flutter", "swiftui", "compose"]).default("web"),
+  includeVisual: z.boolean().default(true),
+});
+
 function jsonResult(value: unknown) {
   return {
     content: [
@@ -72,6 +83,27 @@ function errorResult(error: unknown) {
           2,
         ),
       },
+    ],
+  };
+}
+
+function visualResult(value: unknown) {
+  const visual = visualContextSchema.parse(value);
+  const metadata = {
+    ...visual,
+    items: visual.items.map(({ data: _data, ...item }) => item),
+  };
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(metadata, null, 2),
+      },
+      ...visual.items.map((item) => ({
+        type: "image" as const,
+        data: item.data,
+        mimeType: item.mimeType,
+      })),
     ],
   };
 }
@@ -163,6 +195,23 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
   );
 
   server.registerTool(
+    "design.get_visual_context",
+    {
+      title: "Read design visual context",
+      description: "Render the selected node or screen as PNG image content and return its visual metadata.",
+      inputSchema: visualInput.shape,
+    },
+    async ({ host, scope, screenId }) => {
+      try {
+        const adapter = new BridgeHostAdapter(bridge, resolveHost(bridge, host));
+        return visualResult(await adapter.getVisualContext(scope, screenId));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
     "design.export_ir",
     {
       title: "Export DesignIR",
@@ -185,6 +234,60 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
         const adapter = new BridgeHostAdapter(bridge, resolveHost(bridge, host));
         const snapshot = await adapter.exportIR(scope, screenId);
         return jsonResult(generateCode(snapshot, target));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "design.get_design_context",
+    {
+      title: "Read complete design context",
+      description: "Return design properties, a visual PNG, and generated target code together so an agent can reason from structure, appearance, and implementation.",
+      inputSchema: designContextInput.shape,
+    },
+    async ({ host, scope, screenId, target, includeVisual }) => {
+      try {
+        const adapter = new BridgeHostAdapter(bridge, resolveHost(bridge, host));
+        const snapshot = await adapter.exportIR(scope, screenId);
+        const generated = generateCode(snapshot, target);
+        const visual = includeVisual
+          ? await adapter.getVisualContext(scope, screenId)
+          : undefined;
+        const content = [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              properties: snapshot,
+              visual: visual
+                ? {
+                    scope: visual.scope,
+                    host: visual.host,
+                    items: visual.items.map(({ data: _data, ...item }) => item),
+                  }
+                : null,
+              code: {
+                target: generated.target,
+                files: Object.keys(generated.files),
+                nodeCount: generated.nodeCount,
+                screenCount: generated.screenCount,
+              },
+            }, null, 2),
+          },
+          ...(visual
+            ? visual.items.map((item) => ({
+                type: "image" as const,
+                data: item.data,
+                mimeType: item.mimeType,
+              }))
+            : []),
+          ...Object.entries(generated.files).map(([name, source]) => ({
+            type: "text" as const,
+            text: `// ${name}\n${source}`,
+          })),
+        ];
+        return { content };
       } catch (error) {
         return errorResult(error);
       }

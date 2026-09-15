@@ -626,7 +626,8 @@ function mobileOpacity(node: DesignNode): number | undefined {
 }
 
 function isActionNode(node: DesignNode): boolean {
-  return /\b(button|cta|action|link|submit|continue|next|save|cancel|confirm)\b/.test(node.name.toLowerCase());
+  if (node.kind === "root" || node.kind === "screen") return false;
+  return /\b(button|cta|link|submit|continue|next|save|cancel|confirm)\b/.test(node.name.toLowerCase());
 }
 
 function flutterColor(color: Color | undefined): string {

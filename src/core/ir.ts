@@ -60,6 +60,27 @@ export const strokeSchema = z.object({
 });
 export type Stroke = z.infer<typeof strokeSchema>;
 
+export const visualItemSchema = z.object({
+  nodeId: z.string().min(1),
+  nodeName: z.string(),
+  mimeType: z.literal("image/png"),
+  data: z.string().min(1),
+  bounds: boundsSchema.nullable(),
+  scale: z.number().finite().positive(),
+});
+export type VisualItem = z.infer<typeof visualItemSchema>;
+
+export const visualContextSchema = z.object({
+  schemaVersion: z.literal(IR_SCHEMA_VERSION),
+  scope: z.enum(["selection", "screen"]),
+  host: hostKindSchema,
+  documentId: z.string().min(1),
+  documentName: z.string(),
+  items: z.array(visualItemSchema).min(1),
+  exportedAt: z.string().datetime({ offset: true }),
+});
+export type VisualContext = z.infer<typeof visualContextSchema>;
+
 export const typographySchema = z.object({
   family: z.string().optional(),
   style: z.string().optional(),
@@ -134,6 +155,7 @@ export const hostCapabilitiesSchema = z.object({
     createComponent: z.boolean(),
     updateSelection: z.boolean(),
     userActionRequiredForWrite: z.boolean(),
+    visualRead: z.boolean().optional(),
   }),
 });
 export type HostCapabilities = z.infer<typeof hostCapabilitiesSchema>;

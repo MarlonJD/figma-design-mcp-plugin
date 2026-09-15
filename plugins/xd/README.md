@@ -16,9 +16,9 @@ plugin.
 3. Launch Adobe XD and load the **DesignPort** command or panel.
 
 The plugin connects to `ws://127.0.0.1:5514` and registers as the `xd` host.
-Read operations are available immediately. XD write requests are queued and
-must be applied from the panel inside a user-initiated
-`application.editDocument()` call.
+Read operations, including PNG visual rendering through XD renditions, are
+available immediately. XD write requests are queued and must be applied from
+the panel inside a user-initiated `application.editDocument()` call.
 
 XD does not expose an API for creating a new component definition or
 `SymbolInstance` directly. The adapter reports that capability as unsupported

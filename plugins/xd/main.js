@@ -1,4 +1,5 @@
 const { entrypoints } = require("uxp");
+const { localFileSystem, formats } = require("uxp").storage;
 const scenegraph = require("scenegraph");
 const application = require("application");
 
@@ -15,6 +16,7 @@ const CAPABILITIES = {
     "get_capabilities",
     "get_selection_context",
     "get_screen_context",
+    "get_visual_context",
     "export_ir",
     "create_screen",
     "create_component",
@@ -27,6 +29,7 @@ const CAPABILITIES = {
     createComponent: false,
     updateSelection: true,
     userActionRequiredForWrite: true,
+    visualRead: true,
   },
 };
 
@@ -297,6 +300,77 @@ function screenContext(screenId) {
   };
 }
 
+function visualTargets(scope, screenId) {
+  if (scope === "screen") {
+    const screen = findScreen(screenId);
+    if (!screen) {
+      throw new Error("No XD artboard was found for the requested visual context");
+    }
+    return [screen];
+  }
+  const selected = selectionItems();
+  if (!selected.length) {
+    throw new Error("XD selection is empty");
+  }
+  return selected.slice(0, 4);
+}
+
+function base64FromArrayBuffer(value) {
+  const bytes = value instanceof ArrayBuffer
+    ? new Uint8Array(value)
+    : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let result = "";
+  for (let index = 0; index < bytes.length; index += 3) {
+    const first = bytes[index];
+    const second = index + 1 < bytes.length ? bytes[index + 1] : 0;
+    const third = index + 2 < bytes.length ? bytes[index + 2] : 0;
+    result += alphabet[first >> 2];
+    result += alphabet[((first & 3) << 4) | (second >> 4)];
+    result += index + 1 < bytes.length ? alphabet[((second & 15) << 2) | (third >> 6)] : "=";
+    result += index + 2 < bytes.length ? alphabet[third & 63] : "=";
+  }
+  return result;
+}
+
+async function visualContext(scope, screenId) {
+  const targets = visualTargets(scope, screenId);
+  const items = [];
+  for (let index = 0; index < targets.length; index += 1) {
+    const target = targets[index];
+    const bounds = boundsOf(target);
+    const maxDimension = Math.max(bounds ? bounds.width : 0, bounds ? bounds.height : 0);
+    const scale = maxDimension > 1024 ? Math.max(0.1, 1024 / maxDimension) : 1;
+    const folder = await localFileSystem.getTemporaryFolder();
+    const file = await folder.createFile(`designport-${Date.now()}-${index}.png`);
+    await application.createRenditions([{
+      node: target,
+      outputFile: file,
+      type: application.RenditionType.PNG,
+      scale,
+    }]);
+    const bytes = await file.read({ format: formats.binary });
+    items.push({
+      nodeId: nodeId(target),
+      nodeName: typeof target.name === "string" ? target.name : nodeType(target),
+      mimeType: "image/png",
+      data: base64FromArrayBuffer(bytes),
+      bounds,
+      scale,
+    });
+  }
+  const info = documentInfo();
+  return {
+    schemaVersion: 1,
+    scope,
+    host: "xd",
+    documentId: info.documentId,
+    documentName: info.documentName,
+    items,
+    exportedAt: new Date().toISOString(),
+  };
+}
+
 function colorToHex(color) {
   if (!color) return "#FFFFFF";
   const channel = (value) => Math.round(clamp(value, 0, 1) * 255).toString(16).padStart(2, "0");
@@ -429,6 +503,16 @@ async function handleRequest(request) {
         return;
       case "get_screen_context":
         sendResponse(request.requestId, true, screenContext(request.payload && request.payload.screenId));
+        return;
+      case "get_visual_context":
+        sendResponse(
+          request.requestId,
+          true,
+          await visualContext(
+            (request.payload && request.payload.scope) || "screen",
+            request.payload && request.payload.screenId,
+          ),
+        );
         return;
       case "export_ir": {
         const scope = (request.payload && request.payload.scope) || "document";

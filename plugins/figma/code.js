@@ -9,6 +9,7 @@ const CAPABILITIES = {
     "get_capabilities",
     "get_selection_context",
     "get_screen_context",
+    "get_visual_context",
     "export_ir",
     "create_screen",
     "create_component",
@@ -21,6 +22,7 @@ const CAPABILITIES = {
     createComponent: true,
     updateSelection: true,
     userActionRequiredForWrite: false,
+    visualRead: true,
   },
 };
 
@@ -84,6 +86,20 @@ function paintsToIR(paints) {
   });
 }
 
+function strokesToIR(node) {
+  if (!Array.isArray(node.strokes)) return undefined;
+  const position = {
+    INSIDE: "inside",
+    OUTSIDE: "outside",
+    CENTER: "center",
+  }[node.strokeAlign];
+  return paintsToIR(node.strokes).map((fill) => ({
+    fills: [fill],
+    ...(Number.isFinite(node.strokeWeight) ? { weight: Math.max(0, node.strokeWeight) } : {}),
+    ...(position ? { position } : {}),
+  }));
+}
+
 function typographyFor(node) {
   if (node.type !== "TEXT") return undefined;
   const result = {};
@@ -144,7 +160,7 @@ function nodeToIR(node, parentId, topLevel) {
     visible: node.visible !== false,
     opacity: Number.isFinite(node.opacity) ? clamp(node.opacity, 0, 1) : undefined,
     fills: Array.isArray(node.fills) ? paintsToIR(node.fills) : undefined,
-    strokes: Array.isArray(node.strokes) ? paintsToIR(node.strokes) : undefined,
+    strokes: strokesToIR(node),
     text: node.type === "TEXT" ? node.characters : undefined,
     typography: typographyFor(node),
     layout: layoutFor(node),
@@ -241,6 +257,50 @@ function screenContext(screenId) {
     screenId: screen.id,
     selection: selectionItems().map((item) => ref(item.id)),
     nodes,
+    exportedAt: new Date().toISOString(),
+  };
+}
+
+function visualTargets(scope, screenId) {
+  if (scope === "screen") {
+    const screen = findScreen(screenId);
+    if (!screen) throw new Error("No Figma screen frame was found for the requested visual context");
+    return [screen];
+  }
+  const selected = selectionItems();
+  if (!selected.length) throw new Error("Figma selection is empty");
+  return selected.slice(0, 4);
+}
+
+async function visualContext(scope, screenId) {
+  const targets = visualTargets(scope, screenId);
+  const items = [];
+  for (const target of targets) {
+    const bounds = boundsFor(target);
+    const maxDimension = Math.max(bounds ? bounds.width : 0, bounds ? bounds.height : 0);
+    const scale = maxDimension > 1024 ? Math.max(0.1, 1024 / maxDimension) : 1;
+    const bytes = await target.exportAsync({
+      format: "PNG",
+      contentsOnly: true,
+      constraint: { type: "SCALE", value: scale },
+    });
+    items.push({
+      nodeId: target.id,
+      nodeName: target.name || target.type,
+      mimeType: "image/png",
+      data: figma.base64Encode(bytes),
+      bounds,
+      scale,
+    });
+  }
+  const info = documentInfo();
+  return {
+    schemaVersion: 1,
+    scope,
+    host: "figma",
+    documentId: info.documentId,
+    documentName: info.documentName,
+    items,
     exportedAt: new Date().toISOString(),
   };
 }
@@ -354,6 +414,12 @@ async function handleRequest(request) {
         break;
       case "get_screen_context":
         result = screenContext(request.payload && request.payload.screenId);
+        break;
+      case "get_visual_context":
+        result = await visualContext(
+          (request.payload && request.payload.scope) || "screen",
+          request.payload && request.payload.screenId,
+        );
         break;
       case "export_ir": {
         const scope = (request.payload && request.payload.scope) || "document";

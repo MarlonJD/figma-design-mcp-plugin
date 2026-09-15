@@ -10,8 +10,10 @@ import {
   type DesignPatch,
   type HostCapabilities,
   type HostKind,
+  type VisualContext,
   screenSpecSchema,
   type ScreenSpec,
+  visualContextSchema,
 } from "./ir.js";
 import { DesignPortBridge } from "../bridge/bridge-server.js";
 
@@ -20,6 +22,7 @@ export interface DesignHostAdapter {
   getCapabilities(): Promise<HostCapabilities>;
   getSelectionContext(): Promise<ContextIR>;
   getScreenContext(screenId?: string): Promise<ContextIR>;
+  getVisualContext(scope: "selection" | "screen", screenId?: string): Promise<VisualContext>;
   exportIR(scope: "document" | "selection" | "screen", screenId?: string): Promise<DesignIR | ContextIR>;
   createScreen(spec: ScreenSpec): Promise<unknown>;
   createComponent(spec: ComponentSpec): Promise<unknown>;
@@ -48,6 +51,19 @@ export class BridgeHostAdapter implements DesignHostAdapter {
     const payload = screenId ? { screenId } : {};
     return contextIRSchema.parse(
       await this.bridge.request(this.host, "get_screen_context", payload),
+    );
+  }
+
+  async getVisualContext(
+    scope: "selection" | "screen",
+    screenId?: string,
+  ): Promise<VisualContext> {
+    const payload = {
+      scope,
+      ...(screenId ? { screenId } : {}),
+    };
+    return visualContextSchema.parse(
+      await this.bridge.request(this.host, "get_visual_context", payload),
     );
   }
 

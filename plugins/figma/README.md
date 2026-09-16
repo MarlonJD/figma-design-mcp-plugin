@@ -35,11 +35,13 @@ applied immediately by the plugin.
 The export also includes local variables/styles as `tokens`, node style and
 variable bindings, mixed text style ranges, component properties and variant
 state values, accessibility/annotation metadata, and interaction details. A
-request can set `maxNodes`, `nodeOffset`, `includeAssets`, `maxAssetBytes`, and
-`includeTokens`, plus `detail` (`summary`, `structure`, or `full`). The
-response reports `pagination`, `exportStats`, and a session-stable `snapshot`.
-Reuse `knownSnapshotId` to receive `unchanged: true`, or set `changedOnly` to
-receive the observed changed nodes for a cache merge.
+request can set `maxNodes`, an opaque `cursor`, `includeAssets`, `maxAssetBytes`,
+`includeTokens`, text/token/response budgets, and `detail` (`summary`,
+`structure`, or `full`). The response reports `captureId`, `responseType`,
+`pagination`, `exportStats`, coverage, and a complete `snapshot`. Reuse
+`knownSnapshotId` to receive `responseType: "not-modified"`, or set
+`changedOnly` to receive whole-node upserts and `removedNodeIds` for a safe
+cache merge. Incompatible baselines require a fresh capture.
 
 Asset data is embedded only for visible vector and image-painted nodes. If a
 host export fails, the structural node remains available and the missing

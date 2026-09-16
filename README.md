@@ -60,10 +60,13 @@ integration.
   annotations, and accessibility signals when the host provides them.
 - Paginate large documents and cap embedded asset bytes so an agent can request
   context in deliberate chunks.
-- Return session-stable snapshot/revision metadata so an agent can reuse a
-  known snapshot or request only observed changes.
+- Return session/document/scope-stable capture identities and explicit `full`,
+  `delta`, `not-modified`, or `resync-required` responses so an agent can cache
+  evidence without treating an omission as proof of absence.
 - Offer `summary`, `structure`, and `full` context detail modes for deliberate
   context budgeting.
+- Return bounded asset descriptors and retrieve their original/rendered bytes
+  independently with `design.get_asset`.
 - Run deterministic semantic audits for layout, accessibility, interaction,
   component, and token evidence.
 - Expose a component/instance and prototype-interaction graph alongside the
@@ -86,6 +89,8 @@ The available MCP tools are:
 | `design.get_screen_context` | Read one screen/artboard and its descendants. |
 | `design.get_visual_context` | Render a selection or screen as PNG image content. |
 | `design.export_ir` | Export document, selection, or screen context. |
+| `design.get_asset` | Retrieve one bounded asset from a captured export. |
+| `design.get_operation_status` | Read the status of a queued host write. |
 | `design.audit_context` | Check exported context for deterministic semantic issues. |
 | `design.get_graph` | Read reusable-component and prototype-interaction relationships. |
 | `design.get_design_context` | Return DesignIR properties and the visual PNG together. |
@@ -142,21 +147,30 @@ together: the IR explains what the design is made of, and the image verifies
 what it looks like. Neither layer is treated as an instruction supplied by
 the design file.
 
-For large screens, pass `maxNodes`, `nodeOffset`, `includeAssets`,
-`maxAssetBytes`, `includeTokens`, and `detail` (`summary`, `structure`, or
-`full`) to the context/export tools. The response contains `pagination`,
-`exportStats`, and a `snapshot` object. A harness can request a smaller detail
-mode first, then request the next page without guessing whether a node or asset
-was omitted.
+For large screens, pass `maxNodes`, `includeAssets`, `maxAssetBytes`,
+`includeTokens`, `maxTextBytes`, `maxTokenRecords`, `maxResponseBytes`, and
+`detail` (`summary`, `structure`, or `full`) to the context/export tools. The
+response contains `pagination`, `exportStats`, a `captureId`, a `snapshot`, and
+an explicit `responseType`. Continue with the returned opaque
+`pagination.nextCursor`; cursors address a stored capture and never trigger an
+unchanged shortcut. Omitted evidence includes a machine-readable reason.
 
 To avoid sending a complete context on every loop, reuse the exact
-`snapshot.id` with `knownSnapshotId`. If the document and selection revisions
-are unchanged, the response has `unchanged: true` and no nodes. After a change,
-set `changedOnly: true` with the previous snapshot ID to receive only the
-observed changed nodes; such a response is marked `partial: true` and should be
-merged into the harness cache by node ID. Remove IDs listed in
-`snapshot.deletedNodeIds`. Snapshot IDs include the export shape, so keep the
-detail and asset/token options consistent when reusing one.
+`snapshot.id` with `knownSnapshotId`. An unchanged capture returns
+`responseType: "not-modified"` and no nodes. After a change, set `changedOnly:
+true` with the previous snapshot ID to receive whole-node upserts and
+`removedNodeIds`; merge those fields into the cached complete capture. If the
+baseline is unknown, evicted, incomplete, or incompatible, DesignPort returns
+`responseType: "resync-required"` with an actionable `resyncReason` instead of
+guessing a delta. `tokenState` distinguishes replacement, unchanged, omitted,
+and failed token evidence. Snapshot identity includes the plugin session,
+document, page/scope roots, selected IDs, normalization version, and evidence
+shape; old v1 snapshots are not compatible.
+
+Every write requires `expectedSnapshotId`. Selection updates also require
+explicit `targetIds`, so a queued or delayed operation cannot silently apply to
+a later selection. XD writes remain user-applied and expose a `pendingId` for
+`design.get_operation_status`.
 
 ## Requirements
 
@@ -196,6 +210,10 @@ npm start
 
 The process exposes MCP over stdin/stdout and opens the host-plugin bridge at
 `ws://127.0.0.1:5514`.
+
+Host registration requires the pairing token in `DESIGNPORT_PAIRING_TOKEN`.
+The development plugins use `designport-local-pairing` by default; if you
+change the server token, update the matching plugin constant before connecting.
 
 To use a different local port or request timeout, set environment variables
 before starting the process:

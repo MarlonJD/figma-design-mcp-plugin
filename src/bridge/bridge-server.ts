@@ -13,18 +13,40 @@ import {
   decodeMessage,
   encodeMessage,
   errorResponse,
-  okResponse,
   type EventMessage,
   type HelloMessage,
   type ProtocolMessage,
   type ResponseMessage,
 } from "../core/protocol.js";
+import {
+  operationDefinition,
+  parseOperationOutput,
+  type OperationName,
+} from "../core/operations.js";
+
+const DEFAULT_MAX_CONNECTIONS = 4;
+const DEFAULT_MAX_PENDING_REQUESTS = 64;
+const DEFAULT_MAX_MESSAGE_BYTES = 12_000_000;
+const DEFAULT_MAX_EVENT_LOG = 100;
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 5_000;
 
 export interface BridgeOptions {
   host: string;
   port: number;
   requestTimeoutMs: number;
   serverVersion: string;
+  pairingToken?: string;
+  maxConnections?: number;
+  maxPendingRequests?: number;
+  maxMessageBytes?: number;
+  handshakeTimeoutMs?: number;
+  maxEventLog?: number;
+}
+
+export interface HostSelector {
+  host?: HostKind;
+  sessionId?: string;
+  documentId?: string;
 }
 
 export interface HostSnapshot {
@@ -40,12 +62,16 @@ export interface HostSnapshot {
 export interface HostEventRecord {
   id: string;
   receivedAt: string;
+  sessionId: string;
   host: HostKind;
+  documentId: string | null;
+  sequence: number;
   event: EventMessage["event"];
-  payload: unknown;
+  payload: EventMessage["payload"];
 }
 
 interface PendingRequest {
+  operation: OperationName;
   resolve: (value: unknown) => void;
   reject: (error: unknown) => void;
   timer: NodeJS.Timeout;
@@ -61,6 +87,8 @@ interface HostSession {
   capabilities: HostCapabilities | null;
   connectedAt: string;
   pending: Map<string, PendingRequest>;
+  handshakeTimer: NodeJS.Timeout;
+  lastEventSequence: number;
 }
 
 export interface BridgeEvents {
@@ -69,29 +97,100 @@ export interface BridgeEvents {
   hostEvent: (snapshot: HostSnapshot, message: EventMessage) => void;
 }
 
+function rawDataBytes(data: RawData): number {
+  if (typeof data === "string") return Buffer.byteLength(data);
+  if (data instanceof ArrayBuffer) return data.byteLength;
+  if (Array.isArray(data)) return data.reduce((total, item) => total + item.byteLength, 0);
+  return data.byteLength;
+}
+
+function isLoopbackHost(host: string): boolean {
+  return host === "127.0.0.1" || host === "localhost" || host === "::1";
+}
+
+function normalizeSelector(value: HostKind | HostSelector | undefined): HostSelector {
+  return typeof value === "string" ? { host: value } : value ?? {};
+}
+
 export class DesignPortBridge extends EventEmitter {
-  private readonly options: BridgeOptions;
+  private readonly options: Required<Pick<
+    BridgeOptions,
+    | "host"
+    | "port"
+    | "requestTimeoutMs"
+    | "serverVersion"
+    | "maxConnections"
+    | "maxPendingRequests"
+    | "maxMessageBytes"
+    | "handshakeTimeoutMs"
+    | "maxEventLog"
+  >> & { pairingToken: string };
   private readonly sessions = new Map<string, HostSession>();
-  private readonly activeByHost = new Map<HostKind, string>();
   private readonly eventLog: HostEventRecord[] = [];
   private server: WebSocketServer | null = null;
 
   constructor(options: BridgeOptions) {
     super();
-    this.options = options;
+    if (!isLoopbackHost(options.host)) {
+      throw new DesignPortError(
+        "LOOPBACK_ONLY",
+        "DesignPort only accepts loopback bridge hosts",
+        { host: options.host },
+      );
+    }
+    if (!Number.isInteger(options.port) || options.port < 0 || options.port > 65535) {
+      throw new DesignPortError("INVALID_PORT", "Bridge port must be an integer between 0 and 65535");
+    }
+    if (!Number.isInteger(options.requestTimeoutMs) || options.requestTimeoutMs < 1) {
+      throw new DesignPortError("INVALID_TIMEOUT", "Request timeout must be a positive integer");
+    }
+    const pairingToken = options.pairingToken ?? "designport-local-pairing";
+    if (pairingToken.length < 16) {
+      throw new DesignPortError("PAIRING_TOKEN_TOO_SHORT", "Pairing token must contain at least 16 characters");
+    }
+    this.options = {
+      host: options.host,
+      port: options.port,
+      requestTimeoutMs: options.requestTimeoutMs,
+      serverVersion: options.serverVersion,
+      pairingToken,
+      maxConnections: options.maxConnections ?? DEFAULT_MAX_CONNECTIONS,
+      maxPendingRequests: options.maxPendingRequests ?? DEFAULT_MAX_PENDING_REQUESTS,
+      maxMessageBytes: options.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES,
+      handshakeTimeoutMs: options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS,
+      maxEventLog: options.maxEventLog ?? DEFAULT_MAX_EVENT_LOG,
+    };
+    if (!Number.isInteger(this.options.maxConnections) || this.options.maxConnections < 1) {
+      throw new DesignPortError("INVALID_CONNECTION_LIMIT", "maxConnections must be a positive integer");
+    }
+    if (!Number.isInteger(this.options.maxPendingRequests) || this.options.maxPendingRequests < 1) {
+      throw new DesignPortError("INVALID_PENDING_LIMIT", "maxPendingRequests must be a positive integer");
+    }
+    if (!Number.isInteger(this.options.maxMessageBytes) || this.options.maxMessageBytes < 1024) {
+      throw new DesignPortError("INVALID_MESSAGE_LIMIT", "maxMessageBytes must be at least 1024 bytes");
+    }
+    if (!Number.isInteger(this.options.handshakeTimeoutMs) || this.options.handshakeTimeoutMs < 1) {
+      throw new DesignPortError("INVALID_HANDSHAKE_TIMEOUT", "handshakeTimeoutMs must be a positive integer");
+    }
   }
 
   async start(): Promise<{ host: string; port: number }> {
-    if (this.server) {
-      return this.address();
-    }
+    if (this.server) return this.address();
 
     const server = new WebSocketServer({
       host: this.options.host,
       port: this.options.port,
+      maxPayload: this.options.maxMessageBytes,
+      perMessageDeflate: false,
     });
     this.server = server;
-    server.on("connection", (socket) => this.attachSocket(socket));
+    server.on("connection", (socket) => {
+      if (this.sessions.size >= this.options.maxConnections) {
+        socket.close(1013, "DesignPort connection limit reached");
+        return;
+      }
+      this.attachSocket(socket);
+    });
 
     await new Promise<void>((resolve, reject) => {
       const onListening = () => {
@@ -111,17 +210,14 @@ export class DesignPortBridge extends EventEmitter {
 
   async stop(): Promise<void> {
     const server = this.server;
-    if (!server) {
-      return;
-    }
+    if (!server) return;
 
     for (const session of [...this.sessions.values()]) {
       this.disconnect(session, "Bridge stopped");
+      if (session.socket.readyState !== WebSocket.CLOSED) session.socket.terminate();
     }
 
-    await new Promise<void>((resolve) => {
-      server.close(() => resolve());
-    });
+    await new Promise<void>((resolve) => server.close(() => resolve()));
     this.server = null;
   }
 
@@ -130,7 +226,6 @@ export class DesignPortBridge extends EventEmitter {
     if (!address || typeof address === "string") {
       return { host: this.options.host, port: this.options.port };
     }
-
     const info = address as AddressInfo;
     return { host: info.address, port: info.port };
   }
@@ -146,43 +241,67 @@ export class DesignPortBridge extends EventEmitter {
   }
 
   async request<T>(
-    host: HostKind | undefined,
+    selector: HostKind | HostSelector | undefined,
     operation: string,
     payload: unknown,
   ): Promise<T> {
-    const session = this.selectSession(host);
+    let definition;
+    try {
+      definition = operationDefinition(operation);
+    } catch (error) {
+      throw new DesignPortError("UNSUPPORTED_OPERATION", String(error));
+    }
+    let parsedPayload: unknown;
+    try {
+      parsedPayload = definition.input.parse(payload);
+    } catch (error) {
+      throw new DesignPortError("HOST_REQUEST_INVALID", `Invalid input for ${operation}`, error);
+    }
+
+    const session = this.selectSession(selector, definition.capability);
+    if (session.pending.size >= this.options.maxPendingRequests) {
+      throw new DesignPortError(
+        "HOST_PENDING_LIMIT",
+        `Host pending request limit reached (${this.options.maxPendingRequests})`,
+        { host: session.host, sessionId: session.id },
+      );
+    }
     const requestId = randomUUID();
-    const message = {
-      type: "request" as const,
-      requestId,
-      operation,
-      payload,
-    };
+    const message = { type: "request" as const, requestId, operation, payload: parsedPayload };
+    const encoded = encodeMessage(message);
+    if (Buffer.byteLength(encoded) > this.options.maxMessageBytes) {
+      throw new DesignPortError("PAYLOAD_TOO_LARGE", `Request ${operation} exceeds the bridge payload limit`);
+    }
 
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         session.pending.delete(requestId);
-        reject(
-          new DesignPortError(
-            "HOST_REQUEST_TIMEOUT",
-            `Host did not answer ${operation} within ${this.options.requestTimeoutMs}ms`,
-            { host: session.host, operation, requestId },
-          ),
-        );
+        reject(new DesignPortError(
+          "HOST_REQUEST_TIMEOUT",
+          `Host did not answer ${operation} within ${this.options.requestTimeoutMs}ms`,
+          { host: session.host, operation, requestId },
+        ));
       }, this.options.requestTimeoutMs);
-
       session.pending.set(requestId, {
+        operation: operation as OperationName,
         resolve: (value) => resolve(value as T),
         reject,
         timer,
       });
 
       try {
-        session.socket.send(encodeMessage(message));
+        session.socket.send(encoded, (error?: Error) => {
+          if (!error) return;
+          const pending = session.pending.get(requestId);
+          if (!pending) return;
+          session.pending.delete(requestId);
+          clearTimeout(pending.timer);
+          pending.reject(new DesignPortError("HOST_SEND_FAILED", `Could not send ${operation} to host`, error));
+        });
       } catch (error) {
         clearTimeout(timer);
         session.pending.delete(requestId);
-        reject(error);
+        reject(new DesignPortError("HOST_SEND_FAILED", `Could not send ${operation} to host`, error));
       }
     });
   }
@@ -198,10 +317,20 @@ export class DesignPortBridge extends EventEmitter {
       capabilities: null,
       connectedAt: new Date().toISOString(),
       pending: new Map(),
+      handshakeTimer: setTimeout(() => {
+        this.closeWithError(session, "HANDSHAKE_TIMEOUT", "Host handshake deadline exceeded");
+      }, this.options.handshakeTimeoutMs),
+      lastEventSequence: 0,
     };
     this.sessions.set(session.id, session);
 
-    socket.on("message", (data) => this.handleMessage(session, data));
+    socket.on("message", (data) => {
+      if (rawDataBytes(data) > this.options.maxMessageBytes) {
+        this.closeWithError(session, "PAYLOAD_TOO_LARGE", "Host message exceeds the bridge payload limit");
+        return;
+      }
+      this.handleMessage(session, data);
+    });
     socket.on("close", () => this.disconnect(session, "Socket closed"));
     socket.on("error", () => this.disconnect(session, "Socket error"));
   }
@@ -219,120 +348,127 @@ export class DesignPortBridge extends EventEmitter {
       this.handleHello(session, message);
       return;
     }
-
     if (session.host === null) {
-      this.closeWithError(session, "HANDSHAKE_REQUIRED", "Send hello before other messages");
+      this.closeWithError(session, "HANDSHAKE_REQUIRED", "Send an authenticated hello before other messages");
       return;
     }
-
     if (message.type === "response") {
       this.handleResponse(session, message);
       return;
     }
-
     if (message.type === "event") {
+      if (message.payload.sequence <= session.lastEventSequence) {
+        this.closeWithError(session, "INVALID_EVENT_SEQUENCE", "Host event sequence must increase monotonically");
+        return;
+      }
+      session.lastEventSequence = message.payload.sequence;
       const snapshot = this.snapshot(session as HostSession & { host: HostKind });
       const record: HostEventRecord = {
         id: randomUUID(),
         receivedAt: new Date().toISOString(),
+        sessionId: session.id,
         host: snapshot.host,
+        documentId: snapshot.documentId,
+        sequence: message.payload.sequence,
         event: message.event,
         payload: message.payload,
       };
       this.eventLog.push(record);
-      if (this.eventLog.length > 100) {
-        this.eventLog.shift();
-      }
+      while (this.eventLog.length > this.options.maxEventLog) this.eventLog.shift();
       this.emit("hostEvent", snapshot, message);
       return;
     }
-
     if (message.type === "hello_ack" || message.type === "request") {
       this.closeWithError(session, "UNEXPECTED_MESSAGE", `Unexpected ${message.type} from host`);
     }
   }
 
   private handleHello(session: HostSession, message: HelloMessage): void {
-    const previousSessionId = this.activeByHost.get(message.host);
-    if (previousSessionId && previousSessionId !== session.id) {
-      const previous = this.sessions.get(previousSessionId);
-      if (previous) {
-        this.disconnect(previous, "Superseded by a newer host session");
-      }
+    if (session.host !== null) {
+      this.closeWithError(session, "DUPLICATE_HANDSHAKE", "Only one hello is permitted per connection");
+      return;
     }
-
+    if (message.pairingToken !== this.options.pairingToken) {
+      this.closeWithError(session, "PAIRING_FAILED", "Host pairing authentication failed");
+      return;
+    }
+    clearTimeout(session.handshakeTimer);
     session.host = message.host;
     session.pluginVersion = message.pluginVersion;
     session.documentId = message.documentId ?? null;
     session.documentName = message.documentName ?? null;
     session.capabilities = message.capabilities ?? null;
-    this.activeByHost.set(message.host, session.id);
 
-    session.socket.send(
-      encodeMessage({
+    try {
+      this.send(session, {
         type: "hello_ack",
         protocolVersion: PROTOCOL_VERSION,
         sessionId: session.id,
         serverVersion: this.options.serverVersion,
-      }),
-    );
+      });
+    } catch (error) {
+      this.closeWithError(session, "HOST_SEND_FAILED", "Could not send the host handshake acknowledgement", error);
+      return;
+    }
     this.emit("hostConnected", this.snapshot(session as HostSession & { host: HostKind }));
   }
 
   private handleResponse(session: HostSession, message: ResponseMessage): void {
     const pending = session.pending.get(message.requestId);
-    if (!pending) {
-      return;
-    }
-
+    if (!pending) return;
     session.pending.delete(message.requestId);
     clearTimeout(pending.timer);
-    if (message.ok) {
-      pending.resolve(message.result);
+    if (!message.ok) {
+      pending.reject(new DesignPortError(message.error.code, message.error.message, message.error.details));
       return;
     }
-
-    const error = message.error;
-    pending.reject(
-      new DesignPortError(
-        error?.code ?? "HOST_ERROR",
-        error?.message ?? "The host rejected the request",
-        error?.details,
-      ),
-    );
+    try {
+      pending.resolve(parseOperationOutput(pending.operation, message.result));
+    } catch (error) {
+      pending.reject(new DesignPortError(
+        "HOST_RESPONSE_INVALID",
+        `Host returned an invalid response for ${pending.operation}`,
+        error,
+      ));
+    }
   }
 
-  private selectSession(host: HostKind | undefined): HostSession & { host: HostKind } {
-    if (host) {
-      const sessionId = this.activeByHost.get(host);
-      const session = sessionId ? this.sessions.get(sessionId) : undefined;
-      if (!session || session.host === null) {
-        throw new DesignPortError("HOST_NOT_CONNECTED", `No ${host} plugin is connected`, { host });
-      }
-      return session as HostSession & { host: HostKind };
-    }
-
-    const connected = this.listHosts();
-    if (connected.length === 0) {
-      throw new DesignPortError("HOST_NOT_CONNECTED", "No design host plugin is connected");
-    }
-    if (connected.length > 1) {
+  private selectSession(
+    selectorValue: HostKind | HostSelector | undefined,
+    capability: string,
+  ): HostSession & { host: HostKind } {
+    const selector = normalizeSelector(selectorValue);
+    const connected = [...this.sessions.values()].filter(
+      (session): session is HostSession & { host: HostKind } => session.host !== null,
+    );
+    const matches = connected.filter((session) => (
+      (!selector.host || session.host === selector.host)
+      && (!selector.sessionId || session.id === selector.sessionId)
+      && (!selector.documentId || session.documentId === selector.documentId)
+    ));
+    if (matches.length === 0) {
       throw new DesignPortError(
-        "HOST_SELECTION_REQUIRED",
-        "More than one design host is connected; pass host explicitly",
-        { hosts: connected.map((item) => item.host) },
+        "HOST_NOT_CONNECTED",
+        selector.host ? `No ${selector.host} plugin matches the requested session` : "No design host plugin is connected",
+        selector,
       );
     }
-
-    const selected = connected[0];
-    if (!selected) {
-      throw new DesignPortError("HOST_NOT_CONNECTED", "The selected design host disconnected");
+    if (matches.length > 1) {
+      throw new DesignPortError(
+        "HOST_SELECTION_REQUIRED",
+        "More than one design host session matches; pass sessionId and documentId explicitly",
+        { hosts: matches.map((item) => ({ host: item.host, sessionId: item.id, documentId: item.documentId })) },
+      );
     }
-    const session = this.sessions.get(selected.sessionId);
-    if (!session || session.host === null) {
-      throw new DesignPortError("HOST_NOT_CONNECTED", "The selected design host disconnected");
+    const selected = matches[0]!;
+    if (!(selected.capabilities?.operations ?? []).includes(capability)) {
+      throw new DesignPortError(
+        "HOST_CAPABILITY_REQUIRED",
+        `Host does not advertise the ${capability} operation`,
+        { host: selected.host, capability },
+      );
     }
-    return session as HostSession & { host: HostKind };
+    return selected;
   }
 
   private snapshot(session: HostSession & { host: HostKind }): HostSnapshot {
@@ -347,27 +483,29 @@ export class DesignPortBridge extends EventEmitter {
     };
   }
 
+  private send(session: HostSession, message: ProtocolMessage): void {
+    const encoded = encodeMessage(message);
+    if (Buffer.byteLength(encoded) > this.options.maxMessageBytes) {
+      throw new DesignPortError("PAYLOAD_TOO_LARGE", "Bridge message exceeds the configured payload limit");
+    }
+    session.socket.send(encoded);
+  }
+
   private disconnect(session: HostSession, reason: string): void {
-    if (!this.sessions.has(session.id)) {
-      return;
-    }
-
+    if (!this.sessions.has(session.id)) return;
     this.sessions.delete(session.id);
-    if (session.host && this.activeByHost.get(session.host) === session.id) {
-      this.activeByHost.delete(session.host);
-    }
-
-    const snapshot = session.host === null ? null : this.snapshot(session as HostSession & { host: HostKind });
+    clearTimeout(session.handshakeTimer);
+    const snapshot = session.host === null
+      ? null
+      : this.snapshot(session as HostSession & { host: HostKind });
     for (const pending of session.pending.values()) {
       clearTimeout(pending.timer);
-      pending.reject(
-        new DesignPortError("HOST_DISCONNECTED", `Design host disconnected: ${reason}`, {
-          host: session.host,
-        }),
-      );
+      pending.reject(new DesignPortError("HOST_DISCONNECTED", `Design host disconnected: ${reason}`, {
+        host: session.host,
+        sessionId: session.id,
+      }));
     }
     session.pending.clear();
-
     if (session.socket.readyState === WebSocket.OPEN) {
       session.socket.close(1000, reason.slice(0, 120));
     }
@@ -382,15 +520,7 @@ export class DesignPortBridge extends EventEmitter {
   ): void {
     if (session.socket.readyState === WebSocket.OPEN) {
       try {
-        session.socket.send(
-          encodeMessage(
-            errorResponse("protocol", {
-              code,
-              message,
-              details,
-            }),
-          ),
-        );
+        this.send(session, errorResponse("protocol", { code, message, details }));
       } catch {
         // The socket may have closed between parsing and the error response.
       }

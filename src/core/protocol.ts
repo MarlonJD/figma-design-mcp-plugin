@@ -18,25 +18,51 @@ export const helloMessageSchema = z.object({
   protocolVersion: z.literal(PROTOCOL_VERSION),
   host: hostKindSchema,
   pluginVersion: z.string().min(1),
+  pairingToken: z.string().min(1),
   documentId: z.string().optional(),
   documentName: z.string().optional(),
   capabilities: hostCapabilitiesSchema.optional(),
-});
+}).strict();
 
 export const requestMessageSchema = z.object({
   type: z.literal("request"),
   requestId: z.string().min(1),
   operation: z.string().min(1),
   payload: z.unknown(),
-});
+}).strict();
 
-export const responseMessageSchema = z.object({
+const responseSuccessMessageSchema = z.object({
   type: z.literal("response"),
   requestId: z.string().min(1),
-  ok: z.boolean(),
-  result: z.unknown().optional(),
-  error: protocolErrorSchema.optional(),
-});
+  ok: z.literal(true),
+  result: z.unknown(),
+}).strict();
+
+const responseErrorMessageSchema = z.object({
+  type: z.literal("response"),
+  requestId: z.string().min(1),
+  ok: z.literal(false),
+  error: protocolErrorSchema,
+}).strict();
+
+export const responseMessageSchema = z.discriminatedUnion("ok", [
+  responseSuccessMessageSchema,
+  responseErrorMessageSchema,
+]);
+
+export const hostEventPayloadSchema = z.object({
+  sequence: z.number().int().positive(),
+  documentId: z.string().min(1),
+  documentRevision: z.number().int().nonnegative(),
+  selectionRevision: z.number().int().nonnegative(),
+  affectedNodeIds: z.array(z.string().min(1)).max(200).default([]),
+  removedNodeIds: z.array(z.string().min(1)).max(200).default([]),
+  status: z.string().min(1).max(160).optional(),
+  operation: z.string().min(1).max(80).optional(),
+  pendingId: z.string().min(1).max(160).optional(),
+  requestId: z.string().min(1).max(160).optional(),
+  errorCode: z.string().min(1).max(80).optional(),
+}).strict();
 
 export const eventMessageSchema = z.object({
   type: z.literal("event"),
@@ -48,15 +74,15 @@ export const eventMessageSchema = z.object({
     "write.failed",
     "status",
   ]),
-  payload: z.unknown(),
-});
+  payload: hostEventPayloadSchema,
+}).strict();
 
 export const helloAckMessageSchema = z.object({
   type: z.literal("hello_ack"),
   protocolVersion: z.literal(PROTOCOL_VERSION),
   sessionId: z.string().min(1),
   serverVersion: z.string().min(1),
-});
+}).strict();
 
 export const protocolMessageSchema = z.discriminatedUnion("type", [
   helloMessageSchema,

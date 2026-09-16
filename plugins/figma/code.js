@@ -1,5 +1,6 @@
-const BRIDGE_PROTOCOL_VERSION = 1;
-const PLUGIN_VERSION = "0.3.0";
+const BRIDGE_PROTOCOL_VERSION = 2;
+const PLUGIN_VERSION = "0.4.0";
+const PAIRING_TOKEN = "designport-local-pairing";
 
 const CAPABILITIES = {
   host: "figma",
@@ -18,6 +19,8 @@ const CAPABILITIES = {
     "asset-export",
     "pagination",
     "incremental-snapshots",
+    "bounded-asset-retrieval",
+    "capture-consistency",
   ],
   operations: [
     "ping",
@@ -26,6 +29,8 @@ const CAPABILITIES = {
     "get_screen_context",
     "get_visual_context",
     "export_ir",
+    "get_asset",
+    "get_operation_status",
     "create_screen",
     "create_component",
     "update_selection",
@@ -42,8 +47,10 @@ const CAPABILITIES = {
 };
 
 const MAX_ASSET_EXPORTS_PER_REQUEST = 64;
+const MAX_ASSET_CACHE_BYTES = 32_000_000;
 const assetCache = new Map();
 const assetPromises = new Map();
+let assetCacheBytes = 0;
 const tokenCache = new Map();
 const snapshotState = {
   sessionId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
@@ -52,16 +59,27 @@ const snapshotState = {
   selectionKey: "",
   changeLog: [],
   snapshots: new Map(),
+  evictedSnapshotIds: new Set(),
+  generation: 0,
+  eventSequence: 0,
+  lastCapture: new Map(),
+  assets: new Map(),
+  cursors: new Map(),
 };
 
 const DEFAULT_EXPORT_OPTIONS = {
   maxNodes: 5000,
-  nodeOffset: 0,
+  cursor: undefined,
   includeAssets: true,
   maxAssetBytes: 4000000,
   includeTokens: true,
   detail: "full",
   changedOnly: false,
+  includePages: false,
+  maxTextBytes: 200000,
+  maxTokenRecords: 5000,
+  maxImagePixels: 8000000,
+  maxResponseBytes: 12000000,
 };
 
 figma.showUI(__html__, { visible: false, width: 1, height: 1 });
@@ -78,9 +96,9 @@ function exportOptionsFor(payload) {
     maxNodes: Number.isInteger(input.maxNodes) && input.maxNodes > 0
       ? Math.min(10000, input.maxNodes)
       : DEFAULT_EXPORT_OPTIONS.maxNodes,
-    nodeOffset: Number.isInteger(input.nodeOffset) && input.nodeOffset >= 0
-      ? Math.min(1000000, input.nodeOffset)
-      : DEFAULT_EXPORT_OPTIONS.nodeOffset,
+    ...(typeof input.cursor === "string" && input.cursor.trim()
+      ? { cursor: input.cursor.trim() }
+      : {}),
     includeAssets: input.includeAssets !== false,
     maxAssetBytes: Number.isInteger(input.maxAssetBytes) && input.maxAssetBytes > 0
       ? Math.min(50000000, input.maxAssetBytes)
@@ -93,6 +111,20 @@ function exportOptionsFor(payload) {
       ? { knownSnapshotId: input.knownSnapshotId.trim() }
       : {}),
     changedOnly: input.changedOnly === true,
+    pageId: typeof input.pageId === "string" && input.pageId.trim() ? input.pageId.trim() : undefined,
+    includePages: input.includePages === true,
+    maxTextBytes: Number.isInteger(input.maxTextBytes) && input.maxTextBytes > 0
+      ? Math.min(50000000, input.maxTextBytes)
+      : DEFAULT_EXPORT_OPTIONS.maxTextBytes,
+    maxTokenRecords: Number.isInteger(input.maxTokenRecords) && input.maxTokenRecords > 0
+      ? Math.min(100000, input.maxTokenRecords)
+      : DEFAULT_EXPORT_OPTIONS.maxTokenRecords,
+    maxImagePixels: Number.isInteger(input.maxImagePixels) && input.maxImagePixels > 0
+      ? Math.min(100000000, input.maxImagePixels)
+      : DEFAULT_EXPORT_OPTIONS.maxImagePixels,
+    maxResponseBytes: Number.isInteger(input.maxResponseBytes) && input.maxResponseBytes > 0
+      ? Math.min(100000000, input.maxResponseBytes)
+      : DEFAULT_EXPORT_OPTIONS.maxResponseBytes,
   };
 }
 
@@ -121,60 +153,99 @@ function syncSelectionRevision() {
   rememberChangedNodeIds(selectionItems().map((item) => item.id));
 }
 
-function snapshotFor(scope, screenId, options) {
-  syncSelectionRevision();
+function stableValue(value) {
+  if (Array.isArray(value)) return `[${value.map(stableValue).join(",")}]`;
+  if (!value || typeof value !== "object") return JSON.stringify(value);
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableValue(value[key])}`).join(",")}}`;
+}
+
+function hashValue(value) {
+  let hash = 2166136261;
+  const text = typeof value === "string" ? value : stableValue(value);
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function captureShape(options) {
+  return {
+    detail: options.detail,
+    includeAssets: options.includeAssets,
+    includeTokens: options.includeTokens,
+    maxAssetBytes: options.maxAssetBytes,
+    maxTextBytes: options.maxTextBytes,
+    maxTokenRecords: options.maxTokenRecords,
+  };
+}
+
+function captureIdentity(scope, pageId, rootIds, selectedIds, options) {
   const info = documentInfo();
-  const optionKey = [
-    options.detail,
-    options.includeAssets,
-    options.maxAssetBytes,
-    options.includeTokens,
-  ].join(":");
-  const id = [
-    snapshotState.sessionId,
-    info.documentId,
-    snapshotState.documentRevision,
-    snapshotState.selectionRevision,
+  return {
+    sessionId: snapshotState.sessionId,
+    documentId: info.documentId,
     scope,
-    screenId || "",
-    optionKey,
-  ].join("|");
-  const known = options.knownSnapshotId
-    ? snapshotState.snapshots.get(options.knownSnapshotId)
-    : undefined;
-  const changedNodeIds = new Set();
-  const deletedNodeIds = new Set();
-  snapshotState.changeLog.forEach((change) => {
-    if (!known
-      || change.documentRevision > known.documentRevision
-      || change.selectionRevision > known.selectionRevision) {
-      change.ids.forEach((nodeId) => changedNodeIds.add(nodeId));
-      change.deletedIds.forEach((nodeId) => deletedNodeIds.add(nodeId));
-    }
-  });
-  deletedNodeIds.forEach((nodeId) => changedNodeIds.delete(nodeId));
-  const snapshot = {
-    id,
-    scope,
+    ...(pageId ? { pageId } : {}),
+    scopeRootIds: Array.from(new Set(rootIds.filter(Boolean))),
+    selectedIds: Array.from(new Set(selectedIds.filter(Boolean))),
+    normalizationVersion: "designport-ir-v2",
+    evidenceShape: captureShape(options),
+  };
+}
+
+function captureIdFor(identity, entries) {
+  const observable = entries.map((entry) => ({
+    id: entry.node.id,
+    parentId: entry.parentId || null,
+    children: childrenOf(entry.node).map((child) => child.id),
+    name: entry.node.name,
+    visible: entry.node.visible !== false,
+    bounds: boundsFor(entry.node),
+    text: entry.node.type === "TEXT" ? entry.node.characters : undefined,
+  }));
+  return `capture-${hashValue({
+    identity: { ...identity, evidenceShape: undefined },
     documentRevision: snapshotState.documentRevision,
     selectionRevision: snapshotState.selectionRevision,
-    ...(screenId ? { screenId } : {}),
-    ...(changedNodeIds.size
-      ? { changedNodeIds: Array.from(changedNodeIds).slice(-2000) }
-      : {}),
-    ...(deletedNodeIds.size
-      ? { deletedNodeIds: Array.from(deletedNodeIds).slice(-2000) }
-      : {}),
+    observable,
+  })}`;
+}
+
+function snapshotFor(identity, captureId, fingerprint, nodes, tokens, complete) {
+  const id = `snapshot-${hashValue({ identity, fingerprint })}`;
+  const snapshot = {
+    id,
+    captureId,
+    identity,
+    scope: identity.scope,
+    documentRevision: snapshotState.documentRevision,
+    selectionRevision: snapshotState.selectionRevision,
+    generation: ++snapshotState.generation,
+    complete,
     generatedAt: new Date().toISOString(),
   };
   snapshotState.snapshots.set(id, {
-    documentRevision: snapshot.documentRevision,
-    selectionRevision: snapshot.selectionRevision,
+    snapshot,
+    identity,
+    captureId,
+    fingerprint,
+    nodes,
+    tokens,
   });
-  if (snapshotState.snapshots.size > 128) {
+  while (snapshotState.snapshots.size > 128) {
     const first = snapshotState.snapshots.keys().next().value;
-    if (first) snapshotState.snapshots.delete(first);
+    if (!first) break;
+    const evicted = snapshotState.snapshots.get(first);
+    snapshotState.snapshots.delete(first);
+    snapshotState.evictedSnapshotIds.add(first);
+    if (evicted && !Array.from(snapshotState.snapshots.values()).some((item) => item.captureId === evicted.captureId)) {
+      for (const [artifactId, asset] of snapshotState.assets) {
+        if (asset.captureId === evicted.captureId) snapshotState.assets.delete(artifactId);
+      }
+    }
   }
+  snapshotState.lastCapture.set(identity.scope, { snapshot, fingerprint, captureId });
   return snapshot;
 }
 
@@ -182,6 +253,7 @@ function nodeForDetail(node, detail) {
   if (detail === "full") return node;
   const summaryKeys = new Set([
     "id", "name", "kind", "parentId", "children", "bounds", "renderBounds",
+    "localBounds", "worldBounds",
     "visible", "locked", "description", "rotation", "transform", "clipsContent",
     "minWidth", "maxWidth", "minHeight", "maxHeight", "constraints", "layoutAlign",
     "layoutGrow", "layoutPositioning", "gridPosition", "layout", "hostData",
@@ -190,6 +262,7 @@ function nodeForDetail(node, detail) {
     ...summaryKeys,
     "styleRefs", "variableBindings", "component", "accessibility", "annotations",
     "text", "textSegments", "typography", "prototypeLinks",
+    "untrustedText", "provenance",
   ]);
   const keys = detail === "summary" ? summaryKeys : structureKeys;
   return Object.fromEntries(Object.entries(node).filter(([key]) => keys.has(key)));
@@ -202,6 +275,11 @@ function exportStateFor(options) {
     assetCount: 0,
     assetBytes: 0,
     assetsOmitted: 0,
+    textBytes: 0,
+    tokenRecords: 0,
+    tokenBudgetExceeded: false,
+    imagePixels: 0,
+    omissions: [],
   };
 }
 
@@ -239,6 +317,7 @@ function ref(id) {
 
 function kindFor(node, topLevel) {
   switch (node.type) {
+    case "DOCUMENT": return "root";
     case "PAGE": return "root";
     case "FRAME": return topLevel ? "screen" : "frame";
     case "GROUP": return "group";
@@ -265,6 +344,16 @@ function boundsFor(node) {
     y: Number(bounds.y) || 0,
     width: Math.max(0, Number(bounds.width) || 0),
     height: Math.max(0, Number(bounds.height) || 0),
+  };
+}
+
+function localBoundsFor(node) {
+  if (!node || !Number.isFinite(node.width) || !Number.isFinite(node.height)) return null;
+  return {
+    x: Number(node.x) || 0,
+    y: Number(node.y) || 0,
+    width: Math.max(0, Number(node.width) || 0),
+    height: Math.max(0, Number(node.height) || 0),
   };
 }
 
@@ -419,7 +508,30 @@ function cornersToIR(node) {
 }
 
 function assetCacheKey(node) {
-  return `${figma.root.id}:${node.id}`;
+  return `${snapshotState.sessionId}:${figma.root.id}:${snapshotState.documentRevision}:${snapshotState.generation}:${node.id}`;
+}
+
+function cacheAsset(key, asset) {
+  if (!asset) return;
+  const size = Number.isFinite(asset.size) ? asset.size : 0;
+  const previous = assetCache.get(key);
+  if (previous) assetCacheBytes -= Number.isFinite(previous.size) ? previous.size : 0;
+  assetCache.delete(key);
+  assetCache.set(key, asset);
+  assetCacheBytes += size;
+  while (assetCacheBytes > MAX_ASSET_CACHE_BYTES && assetCache.size > 1) {
+    const first = assetCache.keys().next().value;
+    if (!first) break;
+    const removed = assetCache.get(first);
+    assetCache.delete(first);
+    assetCacheBytes -= removed && Number.isFinite(removed.size) ? removed.size : 0;
+  }
+}
+
+function clearAssetCache() {
+  assetCache.clear();
+  assetCacheBytes = 0;
+  assetPromises.clear();
 }
 
 async function assetFor(node, exportState) {
@@ -431,25 +543,32 @@ async function assetFor(node, exportState) {
   if (!isVector && !imagePaint) return undefined;
 
   const key = assetCacheKey(node);
+  const requestRevision = snapshotState.documentRevision;
   const includeAsset = (asset) => {
     if (!asset) {
       exportState.assetsOmitted += 1;
       return undefined;
     }
-    const byteSize = Number.isFinite(asset.byteSize)
-      ? asset.byteSize
+    const byteSize = Number.isFinite(asset.size)
+      ? asset.size
       : typeof asset.data === "string"
         ? utf8ByteLength(asset.data)
         : 0;
     if (exportState.assetBytes + byteSize > exportState.options.maxAssetBytes) {
       exportState.assetsOmitted += 1;
+      exportState.omissions.push({ kind: "budget", message: "Asset evidence exceeded maxAssetBytes.", nodeIds: [node.id] });
       return undefined;
     }
     exportState.assetCount += 1;
     exportState.assetBytes += byteSize;
     return asset;
   };
-  if (assetCache.has(key)) return includeAsset(assetCache.get(key));
+  if (assetCache.has(key)) {
+    const cached = assetCache.get(key);
+    assetCache.delete(key);
+    assetCache.set(key, cached);
+    return includeAsset(cached);
+  }
   const pending = assetPromises.get(key);
   if (pending) return includeAsset(await pending);
   if (exportState.assetExports >= MAX_ASSET_EXPORTS_PER_REQUEST) {
@@ -463,32 +582,48 @@ async function assetFor(node, exportState) {
       if (isVector) {
         const svg = await node.exportAsync({ format: "SVG_STRING", contentsOnly: true });
         if (typeof svg === "string" && svg.trim()) {
-          return {
+          const artifact = {
             mimeType: "image/svg+xml",
             data: svg,
             kind: "vector",
-            byteSize: utf8ByteLength(svg),
+            artifactId: `asset-${hashValue(`${key}|${svg}`)}`,
+            digest: hashValue(svg),
+            size: utf8ByteLength(svg),
+            sourceNodeIds: [node.id],
           };
+          snapshotState.assets.set(artifact.artifactId, artifact);
+          return artifact;
         }
       }
       if (!imagePaint) return undefined;
       const bytes = await node.exportAsync({ format: "PNG", contentsOnly: true });
-      return {
+      const artifact = {
         mimeType: "image/png",
         data: figma.base64Encode(bytes),
         kind: "image",
-        byteSize: bytes.length,
+        artifactId: `asset-${hashValue(`${key}|${bytes.length}|${bytes[0] || 0}`)}`,
+        digest: hashValue(figma.base64Encode(bytes)),
+        size: bytes.length,
+        sourceNodeIds: [node.id],
         ...(typeof imagePaint.scaleMode === "string" ? { imageScaleMode: imagePaint.scaleMode.toLowerCase() } : {}),
       };
+      snapshotState.assets.set(artifact.artifactId, artifact);
+      return artifact;
     } catch (_error) {
       // Keep the structural node when a host cannot export one asset.
+      exportState.omissions.push({ kind: "failed", message: "Host could not export this asset.", nodeIds: [node.id] });
       return undefined;
     }
   })();
   assetPromises.set(key, promise);
   try {
     const asset = await promise;
-    assetCache.set(key, asset);
+    if (requestRevision !== snapshotState.documentRevision) {
+      exportState.assetsOmitted += 1;
+      exportState.omissions.push({ kind: "failed", message: "Asset export completed after the document changed.", nodeIds: [node.id] });
+      return undefined;
+    }
+    cacheAsset(key, asset);
     return includeAsset(asset);
   } finally {
     assetPromises.delete(key);
@@ -755,6 +890,7 @@ function annotationsFor(node) {
         .map((property) => property && property.type)
         .filter((type) => typeof type === "string"),
     } : {}),
+    untrusted: true,
   }));
   return result.length ? result : undefined;
 }
@@ -772,7 +908,9 @@ function booleanData(value) {
 
 function inferredAccessibilityFor(node) {
   const name = `${node.name || ""} ${node.type || ""}`.toLowerCase();
-  const headingMatch = name.match(/(?:^|[\s/_-])h([1-6])(?:$|[\s/_-])|(?:^|[\s/_-])heading(?:$|[\s/_-])/);
+  const tokens = name.split(/[\s_-]+/).filter(Boolean);
+  const hasToken = (value) => tokens.includes(value);
+  const headingMatch = name.match(/(?:^|[\s_-])h([1-6])(?:$|[\s_-])|(?:^|[\s_-])heading(?:$|[\s_-])/);
   if (headingMatch || node.type === "TEXT" && /title|heading/.test(name)) {
     return {
       role: "heading",
@@ -781,16 +919,16 @@ function inferredAccessibilityFor(node) {
     };
   }
   const rolePatterns = [
-    ["button", /button|cta/],
-    ["link", /link|hyperlink/],
-    ["checkbox", /checkbox/],
-    ["switch", /switch|toggle/],
-    ["textbox", /input|textfield|text-field|search/],
-    ["tab", /tab/],
-    ["navigation", /navigation|navbar|nav-bar|bottom-nav/],
-    ["img", /image|photo|avatar|thumbnail/],
+    ["button", ["button", "cta"]],
+    ["link", ["link", "hyperlink"]],
+    ["checkbox", ["checkbox"]],
+    ["switch", ["switch", "toggle"]],
+    ["textbox", ["input", "textfield", "search"]],
+    ["tab", ["tab"]],
+    ["navigation", ["navigation", "navbar", "bottom-nav"]],
+    ["img", ["image", "photo", "avatar", "thumbnail"]],
   ];
-  const match = rolePatterns.find(([, pattern]) => pattern.test(name));
+  const match = rolePatterns.find(([, roleTokens]) => roleTokens.some((token) => hasToken(token)));
   return match ? { role: match[0], confidence: 0.4 } : undefined;
 }
 
@@ -806,11 +944,11 @@ function accessibilityFor(node) {
     }
   }
   const configuredRole = nonEmptyString(configured.role) || pluginDataFor(node, "a11y.role");
-  const configuredLabel = typeof configured.label === "string" ? configured.label : pluginDataFor(node, "a11y.label");
+  const configuredLabel = typeof configured.label === "string" ? configured.label : nonEmptyString(pluginDataFor(node, "a11y.label"));
   const configuredDescription = typeof configured.description === "string"
     ? configured.description
-    : pluginDataFor(node, "a11y.description");
-  const configuredAltText = typeof configured.altText === "string" ? configured.altText : pluginDataFor(node, "a11y.altText");
+    : nonEmptyString(pluginDataFor(node, "a11y.description"));
+  const configuredAltText = typeof configured.altText === "string" ? configured.altText : nonEmptyString(pluginDataFor(node, "a11y.altText"));
   const configuredHeadingLevel = Number(configured.headingLevel || pluginDataFor(node, "a11y.headingLevel"));
   const configuredFocusable = typeof configured.focusable === "boolean"
     ? configured.focusable
@@ -848,8 +986,28 @@ function accessibilityFor(node) {
     ...(headingLevel !== undefined ? { headingLevel } : {}),
     ...(configuredFocusable !== undefined ? { focusable: configuredFocusable } : {}),
     ...(configuredDecorative !== undefined ? { decorative: configuredDecorative } : {}),
-    source: explicit ? "explicit" : "inferred",
+    source: configuredRole || configuredLabel !== undefined || configuredDescription !== undefined
+      || configuredAltText !== undefined || configuredFocusable !== undefined || configuredDecorative !== undefined
+      ? "plugin-data" : inferred.role ? "inferred" : "host",
     confidence: explicit ? 1 : inferred.confidence,
+    provenance: {
+      ...(configuredRole
+        ? { role: { source: "plugin-data", sourceField: "designport.accessibility.role" } }
+        : inferred.role
+          ? { role: { source: "inferred", sourceField: "node.name", inferenceRuleVersion: "accessibility-name-v2" } }
+          : {}),
+      ...(configuredLabel !== undefined
+        ? { label: { source: "plugin-data", sourceField: "designport.accessibility.label" } }
+        : label !== undefined
+          ? { label: { source: "inferred", sourceField: "node.characters", inferenceRuleVersion: "accessibility-name-v2" } }
+          : {}),
+      ...(description !== undefined
+        ? { description: { source: configuredDescription ? "plugin-data" : "host", sourceField: configuredDescription ? "designport.accessibility.description" : "node.description" } }
+        : {}),
+      ...(configuredAltText !== undefined
+        ? { altText: { source: "plugin-data", sourceField: "designport.accessibility.altText" } }
+        : {}),
+    },
   };
 }
 
@@ -918,7 +1076,7 @@ function styleTokenFor(style, source, type, value) {
 
 async function tokenCatalog(options) {
   if (!options.includeTokens || options.detail === "summary") return [];
-  const key = figma.root.id;
+  const key = `${snapshotState.sessionId}:${figma.root.id}:${snapshotState.documentRevision}`;
   if (tokenCache.has(key)) return tokenCache.get(key);
   const promise = (async () => {
     const variablesAPI = figma.variables || figma;
@@ -959,12 +1117,12 @@ async function tokenCatalog(options) {
       const valuesByMode = {};
       modes.forEach((mode) => {
         if (Object.prototype.hasOwnProperty.call(variable.valuesByMode || {}, mode.modeId)) {
-          valuesByMode[mode.name || mode.modeId] = tokenValueFor(variable.valuesByMode[mode.modeId]);
+          valuesByMode[mode.modeId] = tokenValueFor(variable.valuesByMode[mode.modeId]);
         }
       });
       const defaultMode = modes.find((mode) => mode.modeId === (collection && collection.defaultModeId));
-      const defaultValue = defaultMode && Object.prototype.hasOwnProperty.call(valuesByMode, defaultMode.name || defaultMode.modeId)
-        ? valuesByMode[defaultMode.name || defaultMode.modeId]
+      const defaultValue = defaultMode && Object.prototype.hasOwnProperty.call(valuesByMode, defaultMode.modeId)
+        ? valuesByMode[defaultMode.modeId]
         : undefined;
       const type = {
         COLOR: "color",
@@ -980,7 +1138,7 @@ async function tokenCatalog(options) {
         ...(Object.keys(valuesByMode).length ? { valuesByMode } : {}),
         ...(collection && typeof collection.id === "string" ? { collectionId: collection.id } : {}),
         ...(collection && nonEmptyString(collection.name) ? { collectionName: collection.name } : {}),
-        ...(modes.length ? { modes: modes.map((mode) => ({ id: mode.modeId, name: mode.name })) } : {}),
+        ...(modes.length ? { modes: modes.map((mode) => ({ id: mode.modeId, name: mode.name || mode.modeId })) } : {}),
         ...(nonEmptyString(variable.description) ? { description: variable.description } : {}),
         ...(Array.isArray(variable.scopes) && variable.scopes.length ? { scopes: [...variable.scopes] } : {}),
         ...(variable.codeSyntax && typeof variable.codeSyntax === "object" ? {
@@ -988,8 +1146,28 @@ async function tokenCatalog(options) {
             Object.entries(variable.codeSyntax).filter(([, value]) => typeof value === "string"),
           ),
         } : {}),
+        resolutionStatus: Object.values(valuesByMode).some((value) => value && typeof value === "object" && value.alias)
+          ? "alias"
+          : "resolved",
         source: "variable",
       });
+    });
+    const aliases = new Map(result
+      .filter((token) => token.source === "variable" && token.value && typeof token.value === "object" && token.value.alias)
+      .map((token) => [token.id, token.value.alias]));
+    result.forEach((token) => {
+      let current = token.id;
+      const visited = new Set();
+      while (aliases.has(current) && !visited.has(current)) {
+        visited.add(current);
+        current = aliases.get(current);
+      }
+      if (visited.has(current)) {
+        token.aliasCycle = true;
+        token.resolutionStatus = "cycle";
+      } else if (aliases.has(token.id)) {
+        token.aliasOf = aliases.get(token.id);
+      }
     });
     return result;
   })();
@@ -1141,10 +1319,15 @@ function prototypeLinksFor(node) {
         ...(Array.isArray(action.conditionalBlocks) ? { conditionalBlocks: action.conditionalBlocks } : {}),
         ...(action.data && typeof action.data === "object" ? action.data : {}),
       };
+      const destinationId = typeof action.destinationId === "string" ? action.destinationId : undefined;
+      const actionType = action.type.toLowerCase();
       links.push({
         trigger,
-        action: action.type.toLowerCase(),
-        ...(typeof action.destinationId === "string" ? { destinationId: action.destinationId } : {}),
+        action: actionType,
+        resolutionStatus: destinationId || typeof action.url === "string"
+          ? "resolved"
+          : /navigate|overlay|swap|back/.test(actionType) ? "unresolved" : "unknown",
+        ...(destinationId ? { destinationId } : {}),
         ...(typeof action.url === "string" ? { url: action.url } : {}),
         ...(typeof action.navigation === "string" ? { navigation: action.navigation.toLowerCase() } : {}),
         ...(action.transition && typeof action.transition.type === "string"
@@ -1239,6 +1422,7 @@ function viewportFor(bounds) {
     height: bounds.height,
     orientation,
     breakpoint,
+    breakpointSource: "heuristic",
   };
 }
 
@@ -1257,10 +1441,23 @@ function screenDetailsFor(page) {
     .filter(Boolean);
 }
 
+function documentPages() {
+  return childrenOf(figma.root).filter((child) => child.type === "PAGE");
+}
+
+function documentScreens() {
+  return documentPages().flatMap((page) => childrenOf(page).filter((child) => child.type === "FRAME"));
+}
+
+function screenDetailsForDocument() {
+  return documentPages().flatMap((page) => screenDetailsFor(page));
+}
+
 async function nodeToIR(node, parentId, topLevel, exportState) {
   const children = childrenOf(node);
   const corners = cornersToIR(node);
   const bounds = boundsFor(node);
+  const localBounds = localBoundsFor(node);
   const renderBounds = renderBoundsFor(node, bounds);
   const transform = affineTransformFor(node.relativeTransform);
   const fills = Array.isArray(node.fills) && node.fills.length ? paintsToIR(node.fills) : undefined;
@@ -1307,6 +1504,8 @@ async function nodeToIR(node, parentId, topLevel, exportState) {
     parentId: parentId || null,
     children: children.map((child) => child.id),
     bounds,
+    ...(localBounds ? { localBounds } : {}),
+    ...(bounds ? { worldBounds: bounds } : {}),
     ...(renderBounds ? { renderBounds } : {}),
     visible: node.visible !== false,
     ...(typeof node.locked === "boolean" && node.locked ? { locked: true } : {}),
@@ -1335,11 +1534,20 @@ async function nodeToIR(node, parentId, topLevel, exportState) {
     ...(component ? { component } : {}),
     ...(accessibility ? { accessibility } : {}),
     ...(annotations ? { annotations } : {}),
-    ...(node.type === "TEXT" ? { text: node.characters } : {}),
+    ...(node.type === "TEXT" ? { text: node.characters, untrustedText: true } : {}),
     ...(textSegments ? { textSegments } : {}),
     ...(typography ? { typography } : {}),
     ...(layout ? { layout } : {}),
     ...(prototypeLinks ? { prototypeLinks } : {}),
+    provenance: {
+      bounds: { source: "host", sourceField: "absoluteBoundingBox" },
+      ...(localBounds ? { localBounds: { source: "host", sourceField: "x,y,width,height" } } : {}),
+      ...(bounds ? { worldBounds: { source: "host", sourceField: "absoluteBoundingBox" } } : {}),
+      ...(layout ? { layout: { source: "host", sourceField: "layoutMode" } } : {}),
+      ...(constraints ? { constraints: { source: "host", sourceField: "constraints" } } : {}),
+      ...(styleRefs ? { styleRefs: { source: "host", sourceField: "*StyleId" } } : {}),
+      ...(variableBindings ? { variableBindings: { source: "host", sourceField: "boundVariables" } } : {}),
+    },
     hostData,
   };
   return nodeForDetail(result, exportState.options.detail);
@@ -1357,128 +1565,410 @@ function selectionItems() {
 }
 
 function flattenSubtree(node, parentId, topLevel, entries) {
-  entries.push({ node, parentId, topLevel });
-  childrenOf(node).forEach((child) => flattenSubtree(
-    child,
-    node.id,
-    node.type === "PAGE" && child.type === "FRAME",
-    entries,
-  ));
+  const pending = [{ node, parentId, topLevel }];
+  while (pending.length) {
+    const current = pending.pop();
+    entries.push(current);
+    const children = childrenOf(current.node);
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      const child = children[index];
+      pending.push({
+        node: child,
+        parentId: current.node.id,
+        topLevel: current.node.type === "PAGE" && child.type === "FRAME",
+      });
+    }
+  }
 }
 
-async function serializeEntries(entries, options, snapshot) {
-  const unchanged = options.knownSnapshotId === snapshot.id;
-  const changedIds = options.changedOnly && snapshot.changedNodeIds
-    ? new Set(snapshot.changedNodeIds)
-    : null;
-  const sourceEntries = unchanged
-    ? []
-    : changedIds && changedIds.size
-      ? entries.filter((entry) => changedIds.has(entry.node.id))
-      : entries;
-  const start = options.nodeOffset;
-  const selected = sourceEntries.slice(start, start + options.maxNodes);
+function defaultCoverage(options, exportState, tokens) {
+  const coverage = {
+    geometry: { status: "complete" },
+    layout: { status: "complete" },
+    typography: { status: "complete" },
+    tokens: options.includeTokens && options.detail !== "summary"
+      ? { status: exportState.tokenBudgetExceeded ? "partial" : "complete", ...(exportState.tokenBudgetExceeded ? { reason: "Token record budget reached." } : {}) }
+      : { status: "omitted", reason: "Token evidence was not requested for this detail shape." },
+    components: { status: "complete" },
+    interactions: { status: "complete" },
+    assets: options.includeAssets && options.detail === "full"
+      ? { status: exportState.assetsOmitted ? "partial" : "complete", ...(exportState.assetsOmitted ? { reason: "Some asset exports exceeded a budget or were unavailable." } : {}) }
+      : { status: "omitted", reason: "Asset evidence was not requested for this detail shape." },
+    accessibility: { status: "complete" },
+  };
+  return coverage;
+}
+
+function captureOptionsFor(options) {
+  return {
+    maxNodes: options.maxNodes,
+    includeAssets: options.includeAssets,
+    maxAssetBytes: options.maxAssetBytes,
+    includeTokens: options.includeTokens,
+    detail: options.detail,
+    cursor: undefined,
+    knownSnapshotId: undefined,
+    changedOnly: false,
+    pageId: options.pageId,
+    includePages: options.includePages,
+    maxTextBytes: options.maxTextBytes,
+    maxTokenRecords: options.maxTokenRecords,
+    maxImagePixels: options.maxImagePixels,
+    maxResponseBytes: options.maxResponseBytes,
+  };
+}
+
+async function materializeEntries(entries, identity, options) {
   const exportState = exportStateFor(options);
   const nodes = [];
-  for (const entry of selected) {
-    nodes.push(await nodeToIR(entry.node, entry.parentId, entry.topLevel, exportState));
+  for (const entry of entries) {
+    const node = await nodeToIR(entry.node, entry.parentId, entry.topLevel, exportState);
+    if (!node) continue;
+    if (typeof node.text === "string") {
+      exportState.textBytes += utf8ByteLength(node.text);
+      if (exportState.textBytes > options.maxTextBytes) {
+        delete node.text;
+        delete node.textSegments;
+        delete node.untrustedText;
+        exportState.omissions.push({ kind: "budget", message: "Text evidence exceeded maxTextBytes.", nodeIds: [node.id] });
+      }
+    }
+    nodes.push(node);
   }
-  const hasMore = start + nodes.length < sourceEntries.length;
-  const partial = !unchanged && (
-    Boolean(options.changedOnly && changedIds && changedIds.size)
-    || start > 0
-    || hasMore
-    || sourceEntries.length < entries.length
+  let tokens = await tokenCatalog(options);
+  if (tokens.length > options.maxTokenRecords) {
+    exportState.tokenBudgetExceeded = true;
+    exportState.omissions.push({ kind: "budget", message: "Token evidence exceeded maxTokenRecords." });
+    tokens = tokens.slice(0, options.maxTokenRecords);
+  }
+  exportState.tokenRecords = tokens.length;
+  const captureId = captureIdFor(identity, entries);
+  nodes.forEach((node) => {
+    if (!node.asset || !node.asset.artifactId) return;
+    node.asset = { ...node.asset, captureId };
+    snapshotState.assets.set(node.asset.artifactId, node.asset);
+  });
+  const fingerprint = hashValue({ nodes, tokens });
+  const snapshot = snapshotFor(
+    identity,
+    captureId,
+    fingerprint,
+    nodes,
+    tokens,
+    exportState.omissions.length === 0,
   );
   return {
     nodes,
-    ...(unchanged ? { unchanged: true } : {}),
-    ...(partial ? { partial: true } : {}),
-    pagination: {
-      offset: start,
-      limit: options.maxNodes,
-      total: sourceEntries.length,
-      returned: nodes.length,
-      hasMore,
-      ...(hasMore ? { nextOffset: start + nodes.length } : {}),
-    },
-    exportStats: {
+    tokens,
+    exportState,
+    captureId,
+    fingerprint,
+    snapshot,
+    identity,
+    options,
+    coverage: defaultCoverage(options, exportState, tokens),
+    stats: {
       totalNodes: entries.length,
       returnedNodes: nodes.length,
       assetCount: exportState.assetCount,
       assetBytes: exportState.assetBytes,
       assetsOmitted: exportState.assetsOmitted,
-      tokenCount: 0,
+      tokenCount: tokens.length,
+      textBytes: exportState.textBytes,
+      tokenRecords: exportState.tokenRecords,
+      imagePixels: exportState.imagePixels,
+      responseBytes: 0,
     },
   };
 }
 
-async function buildDocumentIR(options) {
-  const page = figma.currentPage;
-  const entries = [];
-  flattenSubtree(page, null, true, entries);
-  const snapshot = snapshotFor("document", undefined, options);
-  const serialized = await serializeEntries(entries, options, snapshot);
-  const tokens = serialized.unchanged ? [] : await tokenCatalog(options);
-  const screenDetails = screenDetailsFor(page);
-  const nodes = {};
-  serialized.nodes.forEach((node) => {
-    nodes[node.id] = node;
+function shapeCompatible(left, right) {
+  return left && right && stableValue(left.identity) === stableValue(right.identity);
+}
+
+function cursorParts(cursor) {
+  if (typeof cursor !== "string" || !cursor.trim()) return null;
+  return snapshotState.cursors.get(cursor) || { unknown: true };
+}
+
+function cursorFor(current, sourceNodes, responseType, removedNodeIds, tokenState, offset) {
+  const sourceNodeIds = sourceNodes.map((node) => node.id);
+  const cursor = `cursor-${hashValue({
+    snapshotId: current.snapshot.id,
+    responseType,
+    sourceNodeIds,
+    removedNodeIds,
+    tokenState,
+    offset,
+  })}`;
+  snapshotState.cursors.set(cursor, {
+    snapshotId: current.snapshot.id,
+    responseType,
+    sourceNodeIds,
+    removedNodeIds,
+    tokenState,
+    offset,
   });
-  const info = documentInfo();
-  const screens = page.children
-    .filter((child) => child.type === "FRAME")
-    .map((child) => ref(child.id));
+  while (snapshotState.cursors.size > 256) {
+    const first = snapshotState.cursors.keys().next().value;
+    if (!first) break;
+    snapshotState.cursors.delete(first);
+  }
+  return cursor;
+}
+
+function resyncResult(base, current, reason) {
   return {
-    schemaVersion: 1,
-    host: "figma",
-    documentId: info.documentId,
-    documentName: info.documentName,
-    rootId: page.id,
-    nodes,
-    screens,
-    selection: selectionItems().map((item) => ref(item.id)),
-    snapshot,
-    ...(serialized.unchanged ? { unchanged: true } : {}),
-    ...(serialized.partial ? { partial: true } : {}),
-    ...(tokens.length ? { tokens } : {}),
-    ...(screenDetails.length ? { screenDetails } : {}),
-    pagination: serialized.pagination,
-    exportStats: { ...serialized.exportStats, tokenCount: tokens.length },
-    exportedAt: new Date().toISOString(),
+    ...base,
+    captureId: current.captureId,
+    captureIdentity: current.snapshot.identity,
+    snapshot: current.snapshot,
+    responseType: "resync-required",
+    resyncReason: reason,
+    nodes: Array.isArray(base.nodes) ? [] : {},
+    ...(base.tokens !== undefined ? { tokens: [] } : {}),
+    tokenState: "omitted",
+    omissions: [{ kind: "unavailable", message: reason.message }],
+    coverage: current.coverage,
+    pagination: { limit: current.options.maxNodes, total: current.nodes.length, returned: 0, hasMore: false },
+    exportStats: { ...current.stats, returnedNodes: 0, responseBytes: 0 },
   };
 }
 
-async function selectionContext(options) {
+function responseForCapture(base, current, options, asRecord) {
+  const cursor = cursorParts(options.cursor);
+  if (options.cursor && !cursor) {
+    return resyncResult(base, current, { code: "CURSOR_INVALID", message: "Pagination cursor is malformed." });
+  }
+  if (options.cursor && cursor.unknown) {
+    return resyncResult(base, current, { code: "CURSOR_UNKNOWN", message: "The pagination cursor does not address a known host capture." });
+  }
+  const knownId = options.knownSnapshotId;
+  const knownBaseline = knownId ? snapshotState.snapshots.get(knownId) : undefined;
+  const cursorBaseline = cursor ? snapshotState.snapshots.get(cursor.snapshotId) : undefined;
+  const baseline = cursorBaseline || knownBaseline;
+  if (knownId && !baseline) {
+    return resyncResult(base, current, {
+      code: snapshotState.evictedSnapshotIds.has(knownId) ? "BASELINE_EVICTED" : "BASELINE_UNKNOWN",
+      message: snapshotState.evictedSnapshotIds.has(knownId)
+        ? "The requested baseline was evicted from the host capture store."
+        : "The requested baseline is not known to this plugin session.",
+    });
+  }
+  if (cursor && !cursorBaseline) {
+    return resyncResult(base, current, {
+      code: snapshotState.evictedSnapshotIds.has(cursor.snapshotId) ? "CURSOR_EVICTED" : "CURSOR_UNKNOWN",
+      message: snapshotState.evictedSnapshotIds.has(cursor.snapshotId)
+        ? "The pagination capture was evicted from the host capture store."
+        : "The pagination cursor does not address a known host capture.",
+    });
+  }
+  if (cursor && knownId && cursor.snapshotId !== knownId) {
+    return resyncResult(base, current, { code: "CURSOR_BASELINE_MISMATCH", message: "The pagination cursor and known baseline address different captures." });
+  }
+  if (baseline && (!baseline.snapshot.complete || !shapeCompatible(baseline, current.snapshot))) {
+    return resyncResult(base, current, {
+      code: baseline.snapshot.complete ? "BASELINE_INCOMPATIBLE" : "BASELINE_INCOMPLETE",
+      message: baseline.snapshot.complete
+        ? "The requested baseline was captured with an incompatible scope or evidence shape."
+        : "The requested baseline was not a complete capture.",
+    });
+  }
+  if (baseline && !current.snapshot.complete) {
+    return resyncResult(base, current, {
+      code: "CAPTURE_INCOMPLETE",
+      message: "The current capture is incomplete and cannot safely be used for an incremental response.",
+    });
+  }
+  if (cursor && cursor.snapshotId !== current.snapshot.id) {
+    return resyncResult(base, current, { code: "CURSOR_STALE", message: "Pagination cursor does not address the current stored capture." });
+  }
+
+  let responseType = "full";
+  let sourceNodes = current.nodes;
+  let removedNodeIds = [];
+  let tokenState = options.includeTokens && options.detail !== "summary" ? "replaced" : "omitted";
+  let responseTokens = tokenState === "replaced" ? current.tokens : undefined;
+  if (cursor) {
+    const currentById = new Map(current.nodes.map((node) => [node.id, node]));
+    sourceNodes = cursor.sourceNodeIds.map((id) => currentById.get(id)).filter(Boolean);
+    if (sourceNodes.length !== cursor.sourceNodeIds.length) {
+      return resyncResult(base, current, { code: "CURSOR_CAPTURE_CHANGED", message: "The stored capture no longer contains the nodes addressed by this cursor." });
+    }
+    responseType = cursor.responseType;
+    removedNodeIds = cursor.removedNodeIds;
+    tokenState = cursor.tokenState;
+    responseTokens = tokenState === "replaced" ? current.tokens : undefined;
+  } else if (knownBaseline) {
+    const same = knownBaseline.fingerprint === current.fingerprint;
+    if (options.changedOnly) {
+      if (same) {
+        responseType = "not-modified";
+        sourceNodes = [];
+        tokenState = "unchanged";
+        responseTokens = undefined;
+      } else {
+        responseType = "delta";
+        const oldNodes = new Map(knownBaseline.nodes.map((node) => [node.id, node]));
+        const newIds = new Set(current.nodes.map((node) => node.id));
+        sourceNodes = current.nodes.filter((node) => stableValue(node) !== stableValue(oldNodes.get(node.id)));
+        removedNodeIds = knownBaseline.nodes.filter((node) => !newIds.has(node.id)).map((node) => node.id);
+        tokenState = stableValue(knownBaseline.tokens) === stableValue(current.tokens) ? "unchanged" : "replaced";
+        responseTokens = tokenState === "replaced" ? current.tokens : undefined;
+      }
+    } else if (same) {
+      responseType = "not-modified";
+      sourceNodes = [];
+      tokenState = "unchanged";
+      responseTokens = undefined;
+    }
+  }
+
+  const offset = cursor ? cursor.offset : 0;
+  let selectedNodes = responseType === "not-modified"
+    ? []
+    : sourceNodes.slice(offset, offset + options.maxNodes);
+  const omissions = [...current.exportState.omissions];
+  let nextCursor;
+  const nextCursorFor = () => {
+    const nextOffset = offset + selectedNodes.length;
+    if (nextOffset >= sourceNodes.length) return undefined;
+    nextCursor = nextCursor || cursorFor(
+      current,
+      sourceNodes,
+      responseType,
+      removedNodeIds,
+      tokenState,
+      nextOffset,
+    );
+    return nextCursor;
+  };
+  const pagination = () => {
+    const next = nextCursorFor();
+    return {
+    ...(options.cursor ? { cursor: options.cursor } : {}),
+    limit: options.maxNodes,
+    total: sourceNodes.length,
+    returned: selectedNodes.length,
+    hasMore: offset + selectedNodes.length < sourceNodes.length,
+      ...(next ? { nextCursor: next } : {}),
+    };
+  };
+  const build = () => ({
+    ...base,
+    captureId: current.captureId,
+    captureIdentity: current.snapshot.identity,
+    snapshot: current.snapshot,
+    responseType,
+    ...(removedNodeIds.length ? { removedNodeIds } : {}),
+    tokenState,
+    ...(responseTokens !== undefined ? { tokens: responseTokens } : {}),
+    ...(omissions.length ? { omissions } : {}),
+    coverage: current.coverage,
+    pagination: pagination(),
+    exportStats: {
+      ...current.stats,
+      returnedNodes: selectedNodes.length,
+      responseBytes: 0,
+    },
+    nodes: asRecord
+      ? Object.fromEntries(selectedNodes.map((node) => [node.id, node]))
+      : selectedNodes,
+  });
+  let response = build();
+  while (utf8ByteLength(JSON.stringify(response)) > options.maxResponseBytes && selectedNodes.length > 0) {
+    selectedNodes = selectedNodes.slice(0, -1);
+    if (!omissions.some((item) => item.message.includes("maxResponseBytes"))) {
+      omissions.push({ kind: "budget", message: "Response exceeded maxResponseBytes; retrieve the next cursor for omitted nodes." });
+    }
+    response = build();
+  }
+  const responseBytes = utf8ByteLength(JSON.stringify(response));
+  response.exportStats.responseBytes = responseBytes;
+  if (responseBytes > options.maxResponseBytes) {
+    return resyncResult(base, current, { code: "RESPONSE_BUDGET_EXCEEDED", message: "The requested response budget is too small for its required metadata." });
+  }
+  return response;
+}
+
+async function buildDocumentIR(options) {
+  const root = figma.root;
+  const entries = [];
+  flattenSubtree(root, null, true, entries);
+  const identity = captureIdentity("document", undefined, [root.id], selectionItems().map((item) => item.id), options);
+  const current = await materializeEntries(entries, identity, captureOptionsFor(options));
+  const screenDetails = screenDetailsForDocument();
   const info = documentInfo();
+  const pages = documentPages().map((page) => ref(page.id));
+  const screens = documentScreens().map((screen) => ref(screen.id));
+  return responseForCapture({
+    schemaVersion: 2,
+    host: "figma",
+    documentId: info.documentId,
+    documentName: info.documentName,
+    rootId: root.id,
+    scope: "document",
+    nodes: {},
+    pages,
+    screens,
+    selection: selectionItems().map((item) => ref(item.id)),
+    ...(screenDetails.length ? { screenDetails } : {}),
+    exportedAt: new Date().toISOString(),
+  }, current, options, true);
+}
+
+async function selectionContext(options) {
   const selection = selectionItems();
   const entries = [];
   selection.forEach((item) => flattenSubtree(item, item.parent && item.parent.id, item.parent === figma.currentPage, entries));
-  const snapshot = snapshotFor("selection", undefined, options);
-  const serialized = await serializeEntries(entries, options, snapshot);
-  const tokens = serialized.unchanged ? [] : await tokenCatalog(options);
-  return {
-    schemaVersion: 1,
+  const pageId = figma.currentPage.id;
+  const identity = captureIdentity("selection", pageId, selection.map((item) => item.id), selection.map((item) => item.id), options);
+  const current = await materializeEntries(entries, identity, captureOptionsFor(options));
+  const info = documentInfo();
+  return responseForCapture({
+    schemaVersion: 2,
     scope: "selection",
     host: "figma",
     documentId: info.documentId,
     documentName: info.documentName,
     selection: selection.map((item) => ref(item.id)),
-    nodes: serialized.nodes,
-    snapshot,
-    ...(serialized.unchanged ? { unchanged: true } : {}),
-    ...(serialized.partial ? { partial: true } : {}),
-    ...(tokens.length ? { tokens } : {}),
-    pagination: serialized.pagination,
-    exportStats: { ...serialized.exportStats, tokenCount: tokens.length },
     exportedAt: new Date().toISOString(),
-  };
+    nodes: [],
+  }, current, options, false);
+}
+
+function findPage(pageId) {
+  if (!pageId) return figma.currentPage;
+  const node = figma.getNodeById(pageId);
+  return node && node.type === "PAGE" && node.parent === figma.root ? node : null;
+}
+
+async function pageContext(pageId, options) {
+  const page = findPage(pageId || options.pageId);
+  if (!page) throw new Error("No Figma page was found for the requested page scope");
+  const entries = [];
+  flattenSubtree(page, null, true, entries);
+  const identity = captureIdentity("page", page.id, [page.id], selectionItems().map((item) => item.id), options);
+  const current = await materializeEntries(entries, identity, captureOptionsFor(options));
+  const info = documentInfo();
+  return responseForCapture({
+    schemaVersion: 2,
+    scope: "page",
+    host: "figma",
+    documentId: info.documentId,
+    documentName: info.documentName,
+    pageId: page.id,
+    selection: selectionItems().map((item) => ref(item.id)),
+    nodes: [],
+    ...(screenDetailsFor(page).length ? { screenDetails: screenDetailsFor(page) } : {}),
+    exportedAt: new Date().toISOString(),
+  }, current, options, false);
 }
 
 function findScreen(screenId) {
   if (screenId) {
     const node = figma.getNodeById(screenId);
-    return node && node.parent === figma.currentPage && node.type === "FRAME" ? node : null;
+    return node && node.parent && node.parent.type === "PAGE" && node.type === "FRAME" ? node : null;
   }
   const selected = selectionItems().find((item) => item.parent === figma.currentPage && item.type === "FRAME");
   return selected || figma.currentPage.children.find((child) => child.type === "FRAME") || null;
@@ -1487,35 +1977,33 @@ function findScreen(screenId) {
 async function screenContext(screenId, options) {
   const screen = findScreen(screenId);
   if (!screen) throw new Error("No Figma screen frame was found for the requested screen");
-  const info = documentInfo();
   const entries = [];
   flattenSubtree(screen, screen.parent && screen.parent.id, true, entries);
-  const snapshot = snapshotFor("screen", screen.id, options);
-  const serialized = await serializeEntries(entries, options, snapshot);
-  const tokens = serialized.unchanged ? [] : await tokenCatalog(options);
+  const identity = captureIdentity("screen", screen.parent && screen.parent.id, [screen.id], selectionItems().map((item) => item.id), options);
+  const current = await materializeEntries(entries, identity, captureOptionsFor(options));
+  const info = documentInfo();
   const selection = selectionItems();
   const viewport = viewportFor(boundsFor(screen));
-  return {
-    schemaVersion: 1,
+  return responseForCapture({
+    schemaVersion: 2,
     scope: "screen",
     host: "figma",
     documentId: info.documentId,
     documentName: info.documentName,
     screenId: screen.id,
     selection: selection.map((item) => ref(item.id)),
-    snapshot,
-    ...(serialized.unchanged ? { unchanged: true } : {}),
-    ...(serialized.partial ? { partial: true } : {}),
     ...(viewport ? { viewport } : {}),
-    nodes: serialized.nodes,
-    ...(tokens.length ? { tokens } : {}),
-    pagination: serialized.pagination,
-    exportStats: { ...serialized.exportStats, tokenCount: tokens.length },
     exportedAt: new Date().toISOString(),
-  };
+    nodes: [],
+  }, current, options, false);
 }
 
-function visualTargets(scope, screenId) {
+function visualTargets(scope, screenId, pageId) {
+  if (scope === "page") {
+    const page = findPage(pageId);
+    if (!page) throw new Error("No Figma page was found for the requested visual context");
+    return [page];
+  }
   if (scope === "screen") {
     const screen = findScreen(screenId);
     if (!screen) throw new Error("No Figma screen frame was found for the requested visual context");
@@ -1523,40 +2011,127 @@ function visualTargets(scope, screenId) {
   }
   const selected = selectionItems();
   if (!selected.length) throw new Error("Figma selection is empty");
-  return selected.slice(0, 4);
+  return selected;
 }
 
-async function visualContext(scope, screenId) {
-  const targets = visualTargets(scope, screenId);
+async function visualContext(scope, screenId, options = {}) {
+  syncSelectionRevision();
+  const normalizedOptions = {
+    maxImagePixels: Number.isInteger(options.maxImagePixels) && options.maxImagePixels > 0
+      ? Math.min(100000000, options.maxImagePixels)
+      : DEFAULT_EXPORT_OPTIONS.maxImagePixels,
+    maxImageBytes: Number.isInteger(options.maxImageBytes) && options.maxImageBytes > 0
+      ? Math.min(50000000, options.maxImageBytes)
+      : 12000000,
+  };
+  const targets = visualTargets(scope, screenId, options.pageId);
+  const entries = [];
+  targets.forEach((target) => flattenSubtree(
+    target,
+    target.parent && target.parent.id,
+    scope === "page" || target.parent === figma.currentPage,
+    entries,
+  ));
+  const identity = captureIdentity(
+    scope,
+    scope === "page" ? targets[0].id : scope === "screen" ? targets[0].parent && targets[0].parent.id : figma.currentPage.id,
+    targets.map((target) => target.id),
+    selectionItems().map((item) => item.id),
+    {
+      ...DEFAULT_EXPORT_OPTIONS,
+      detail: "full",
+      includeAssets: false,
+      includeTokens: false,
+      maxAssetBytes: 0,
+      maxTextBytes: 0,
+      maxTokenRecords: 0,
+    },
+  );
+  const captureId = captureIdFor(identity, entries);
   const items = [];
+  let imageBytes = 0;
+  let imagePixels = 0;
   for (const target of targets) {
     const bounds = boundsFor(target);
     const maxDimension = Math.max(bounds ? bounds.width : 0, bounds ? bounds.height : 0);
-    const scale = maxDimension > 1024 ? Math.max(0.1, 1024 / maxDimension) : 1;
+    const area = Math.max(1, (bounds ? bounds.width : 1) * (bounds ? bounds.height : 1));
+    const scale = Math.min(
+      1,
+      maxDimension > 1024 ? 1024 / maxDimension : 1,
+      Math.sqrt(normalizedOptions.maxImagePixels / area),
+    );
     const bytes = await target.exportAsync({
       format: "PNG",
       contentsOnly: true,
       constraint: { type: "SCALE", value: scale },
     });
+    const encoded = figma.base64Encode(bytes);
+    const encodedBytes = utf8ByteLength(encoded);
+    if (imageBytes + encodedBytes > normalizedOptions.maxImageBytes) {
+      const error = new Error("Rendered PNG exceeds maxImageBytes");
+      error.code = "VISUAL_BUDGET_EXCEEDED";
+      throw error;
+    }
+    imageBytes += encodedBytes;
+    const pixelWidth = Math.max(1, Math.ceil((bounds ? bounds.width : 1) * scale));
+    const pixelHeight = Math.max(1, Math.ceil((bounds ? bounds.height : 1) * scale));
+    imagePixels += pixelWidth * pixelHeight;
+    if (imagePixels > normalizedOptions.maxImagePixels) {
+      const error = new Error("Rendered PNG pixels exceed maxImagePixels");
+      error.code = "VISUAL_BUDGET_EXCEEDED";
+      throw error;
+    }
     items.push({
       nodeId: target.id,
       nodeName: target.name || target.type,
       mimeType: "image/png",
-      data: figma.base64Encode(bytes),
+      data: encoded,
       bounds,
       scale,
+      pixelWidth,
+      pixelHeight,
+      cropOrigin: bounds ? { x: bounds.x, y: bounds.y } : undefined,
+      worldToPixel: bounds ? { a: scale, b: 0, c: 0, d: scale, tx: -bounds.x * scale, ty: -bounds.y * scale } : undefined,
+      captureId,
     });
   }
   const info = documentInfo();
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     scope,
     host: "figma",
     documentId: info.documentId,
     documentName: info.documentName,
+    captureId,
+    captureIdentity: identity,
     items,
     exportedAt: new Date().toISOString(),
   };
+}
+
+async function getAsset(payload) {
+  const artifactId = payload && payload.artifactId;
+  const captureId = payload && payload.captureId;
+  const maxBytes = Number.isInteger(payload && payload.maxBytes) && payload.maxBytes > 0
+    ? Math.min(50000000, payload.maxBytes)
+    : 4000000;
+  const asset = snapshotState.assets.get(artifactId);
+  if (!asset) {
+    const error = new Error("Requested asset is unavailable or expired");
+    error.code = "ASSET_UNAVAILABLE";
+    throw error;
+  }
+  if (asset.captureId !== captureId) {
+    const error = new Error("Requested asset belongs to a different capture");
+    error.code = "ASSET_CAPTURE_MISMATCH";
+    throw error;
+  }
+  if (asset.size > maxBytes) {
+    const error = new Error("Requested asset exceeds maxBytes");
+    error.code = "ASSET_BUDGET_EXCEEDED";
+    throw error;
+  }
+  return asset;
 }
 
 function paintFromColor(color) {
@@ -1572,6 +2147,19 @@ function paintFromColor(color) {
 }
 
 function applyPatch(node, patch) {
+  const unsupported = Object.keys(patch || {}).filter((key) => ![
+    "coordinateSpace", "name", "bounds", "visible", "opacity", "fills",
+  ].includes(key));
+  if (unsupported.length) {
+    const error = new Error(`Figma does not support these patch fields: ${unsupported.join(", ")}`);
+    error.code = "UNSUPPORTED_PATCH_FIELD";
+    throw error;
+  }
+  if (Array.isArray(patch.fills) && patch.fills.some((fill) => fill.type !== "solid" || !fill.color)) {
+    const error = new Error("Figma writes currently support solid fills only");
+    error.code = "UNSUPPORTED_PATCH_FIELD";
+    throw error;
+  }
   if (patch.name) node.name = patch.name;
   if (typeof patch.visible === "boolean") node.visible = patch.visible;
   if (Number.isFinite(patch.opacity)) node.opacity = clamp(patch.opacity, 0, 1);
@@ -1579,8 +2167,15 @@ function applyPatch(node, patch) {
     const width = Number.isFinite(patch.bounds.width) ? patch.bounds.width : node.width;
     const height = Number.isFinite(patch.bounds.height) ? patch.bounds.height : node.height;
     if (typeof node.resize === "function") node.resize(width, height);
-    if (Number.isFinite(patch.bounds.x)) node.x = patch.bounds.x;
-    if (Number.isFinite(patch.bounds.y)) node.y = patch.bounds.y;
+    if (Number.isFinite(patch.bounds.x) || Number.isFinite(patch.bounds.y)) {
+      if (patch.coordinateSpace === "world" && node.parent && node.parent.absoluteBoundingBox) {
+        if (Number.isFinite(patch.bounds.x)) node.x = patch.bounds.x - node.parent.absoluteBoundingBox.x;
+        if (Number.isFinite(patch.bounds.y)) node.y = patch.bounds.y - node.parent.absoluteBoundingBox.y;
+      } else {
+        if (Number.isFinite(patch.bounds.x)) node.x = patch.bounds.x;
+        if (Number.isFinite(patch.bounds.y)) node.y = patch.bounds.y;
+      }
+    }
   }
   if (Array.isArray(patch.fills) && patch.fills.length && "fills" in node) {
     node.fills = patch.fills.map((fill) => fill.color ? paintFromColor(fill.color) : { type: "SOLID", color: { r: 0, g: 0, b: 0 } });
@@ -1607,7 +2202,59 @@ async function createComponent(spec) {
   return { status: "applied", node: ref(component.id), kind: "component" };
 }
 
+function validateWriteState(payload, operation) {
+  syncSelectionRevision();
+  const expected = payload && payload.expectedSnapshotId;
+  const baseline = expected && snapshotState.snapshots.get(expected);
+  if (!baseline) {
+    const error = new Error("Write requires a known complete capture snapshot");
+    error.code = snapshotState.evictedSnapshotIds.has(expected) ? "WRITE_BASELINE_EVICTED" : "WRITE_BASELINE_UNKNOWN";
+    throw error;
+  }
+  const info = documentInfo();
+  if (!baseline.snapshot.complete) {
+    const error = new Error("Write requires a complete capture snapshot");
+    error.code = "WRITE_BASELINE_INCOMPLETE";
+    throw error;
+  }
+  if (payload.documentId && payload.documentId !== info.documentId) {
+    const error = new Error("Write documentId does not match the connected document");
+    error.code = "WRITE_DOCUMENT_MISMATCH";
+    throw error;
+  }
+  if (payload.sessionId && payload.sessionId !== baseline.snapshot.identity.sessionId) {
+    const error = new Error("Write sessionId does not match the expected capture");
+    error.code = "WRITE_SESSION_MISMATCH";
+    throw error;
+  }
+  if (baseline.snapshot.identity.documentId !== info.documentId
+    || baseline.snapshot.documentRevision !== snapshotState.documentRevision
+    || baseline.snapshot.selectionRevision !== snapshotState.selectionRevision) {
+    const error = new Error("The expected capture is stale; read a fresh capture before writing");
+    error.code = "WRITE_STALE_CAPTURE";
+    throw error;
+  }
+  if (operation === "update_selection") {
+    const targetIds = Array.isArray(payload.targetIds) ? payload.targetIds : [];
+    const expectedSelectionIds = baseline.snapshot.identity.selectedIds;
+    if (!targetIds.length || !targetIds.every((id) => expectedSelectionIds.includes(id))) {
+      const error = new Error("Write targets are not members of the expected selection capture");
+      error.code = "WRITE_TARGET_MISMATCH";
+      throw error;
+    }
+    const currentSelectionIds = selectionItems().map((item) => item.id);
+    if (currentSelectionIds.length !== expectedSelectionIds.length
+      || currentSelectionIds.some((id, index) => id !== expectedSelectionIds[index])) {
+      const error = new Error("The Figma selection changed after the expected capture");
+      error.code = "WRITE_SELECTION_CHANGED";
+      throw error;
+    }
+  }
+  return baseline;
+}
+
 async function executeWrite(operation, payload) {
+  validateWriteState(payload || {}, operation);
   if (operation === "create_screen") {
     const spec = payload || {};
     const frame = figma.createFrame();
@@ -1621,7 +2268,13 @@ async function executeWrite(operation, payload) {
   }
   if (operation === "create_component") return createComponent(payload || {});
   if (operation === "update_selection") {
-    const items = selectionItems();
+    const targetIds = Array.isArray(payload && payload.targetIds) ? payload.targetIds : [];
+    const items = targetIds.map((id) => figma.getNodeById(id)).filter(Boolean);
+    if (items.length !== targetIds.length) {
+      const error = new Error("One or more write target IDs are unavailable");
+      error.code = "WRITE_TARGET_UNAVAILABLE";
+      throw error;
+    }
     if (!items.length) throw new Error("Figma selection is empty");
     items.forEach((node) => applyPatch(node, (payload && payload.patch) || {}));
     return { status: "applied", nodes: items.map((item) => ref(item.id)) };
@@ -1634,6 +2287,7 @@ function hostHello() {
   return {
     type: "hello",
     protocolVersion: BRIDGE_PROTOCOL_VERSION,
+    pairingToken: PAIRING_TOKEN,
     host: "figma",
     pluginVersion: PLUGIN_VERSION,
     documentId: info.documentId,
@@ -1650,6 +2304,21 @@ function errorPayload(error) {
   return {
     code: error && error.code ? error.code : "FIGMA_PLUGIN_ERROR",
     message: error && error.message ? error.message : String(error),
+    ...(error && error.details !== undefined ? { details: error.details } : {}),
+  };
+}
+
+function eventPayload(affectedNodeIds, removedNodeIds) {
+  syncSelectionRevision();
+  const info = documentInfo();
+  const unique = (ids) => Array.from(new Set((Array.isArray(ids) ? ids : []).filter(Boolean))).slice(0, 200);
+  return {
+    sequence: ++snapshotState.eventSequence,
+    documentId: info.documentId,
+    documentRevision: snapshotState.documentRevision,
+    selectionRevision: snapshotState.selectionRevision,
+    affectedNodeIds: unique(affectedNodeIds),
+    removedNodeIds: unique(removedNodeIds),
   };
 }
 
@@ -1676,6 +2345,7 @@ async function handleRequest(request) {
         result = await visualContext(
           (request.payload && request.payload.scope) || "screen",
           request.payload && request.payload.screenId,
+          request.payload || {},
         );
         break;
       case "export_ir": {
@@ -1685,9 +2355,17 @@ async function handleRequest(request) {
           ? await selectionContext(options)
           : scope === "screen"
             ? await screenContext(request.payload && request.payload.screenId, options)
+            : scope === "page"
+              ? await pageContext(request.payload && request.payload.pageId, options)
             : await buildDocumentIR(options);
         break;
       }
+      case "get_asset":
+        result = await getAsset(request.payload || {});
+        break;
+      case "get_operation_status":
+        result = { pendingId: request.payload && request.payload.pendingId, status: "applied", operation: "unknown", message: "Figma writes are applied synchronously." };
+        break;
       case "create_screen":
       case "create_component":
       case "update_selection":
@@ -1713,40 +2391,37 @@ figma.ui.onmessage = (message) => {
 };
 
 figma.on("selectionchange", () => {
-  void selectionContext({
-    ...DEFAULT_EXPORT_OPTIONS,
-    maxNodes: 500,
-    includeAssets: false,
-    includeTokens: false,
-  })
-    .then((payload) => {
-      sendToUI({
-        type: "bridge_event",
-        value: { type: "event", event: "selection.changed", payload },
-      });
-    })
-    .catch((error) => {
-      sendToUI({
-        type: "bridge_event",
-        value: {
-          type: "event",
-          event: "status",
-          payload: { status: "error", message: error && error.message ? error.message : String(error) },
-        },
-      });
-    });
+  sendToUI({
+    type: "bridge_event",
+    value: {
+      type: "event",
+      event: "selection.changed",
+      payload: eventPayload(selectionItems().map((item) => item.id), []),
+    },
+  });
 });
 
 figma.on("documentchange", (event) => {
   snapshotState.documentRevision += 1;
   const changes = event && Array.isArray(event.documentChanges) ? event.documentChanges : [];
+  const affectedNodeIds = [];
+  const removedNodeIds = [];
   changes.forEach((change) => {
     const id = change && (change.id || change.node && change.node.id);
     const type = typeof (change && change.type) === "string" ? change.type.toUpperCase() : "";
-    rememberChangedNodeIds(type === "DELETE" || type === "DELETED" || type === "REMOVED" ? [] : [id],
-      type === "DELETE" || type === "DELETED" || type === "REMOVED" ? [id] : []);
+    const deleted = type === "DELETE" || type === "DELETED" || type === "REMOVED";
+    rememberChangedNodeIds(deleted ? [] : [id], deleted ? [id] : []);
+    if (deleted) removedNodeIds.push(id);
+    else affectedNodeIds.push(id);
   });
-  assetCache.clear();
-  assetPromises.clear();
+  clearAssetCache();
   tokenCache.clear();
+  sendToUI({
+    type: "bridge_event",
+    value: {
+      type: "event",
+      event: "document.changed",
+      payload: eventPayload(affectedNodeIds, removedNodeIds),
+    },
+  });
 });

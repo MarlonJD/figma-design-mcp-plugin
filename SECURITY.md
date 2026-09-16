@@ -7,14 +7,18 @@ machine and the MCP clients that are allowed to launch it.
 ## Security boundaries
 
 - The bridge listens on `127.0.0.1` by default.
-- The bridge has no authentication layer for remote clients.
+- Host plugins must complete a protocol-v2 pairing-token handshake before the
+  bridge registers a session. Set `DESIGNPORT_PAIRING_TOKEN` to a local secret
+  and update the development plugin constant when using a non-default token.
+- MCP transport is local stdio; the bridge remains loopback-only and does not
+  provide remote or cloud transport.
 - A connected plugin can send selected or document design context to the
   local bridge.
 - `design.create_screen`, `design.create_component`, and
   `design.update_selection` can change an active design document when the host
   supports the operation.
-- The event log is in memory and is bounded; it is not a compliance or audit
-  system.
+- The event log is in memory, bounded, and metadata-only; it is not a
+  compliance or audit system.
 
 Do not bind DesignPort to `0.0.0.0`, a LAN address, or a public interface until
 the transport has authentication, authorization, and a documented threat

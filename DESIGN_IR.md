@@ -28,11 +28,14 @@ Each node can carry several independent layers:
   lower confidence.
 - `asset` contains a local SVG/PNG when the host can export one. A missing
   asset is represented by the node without a fabricated replacement.
-- `asset.byteSize`, `pagination`, and `exportStats` make the context budget
-  observable to an agent instead of hiding omitted data.
-- `snapshot` carries the document/selection revisions and an opaque ID for
-  incremental reads. `unchanged` means the requested snapshot is already known;
-  `partial` means the response is a changed-only or paginated subset.
+- `asset` is a bounded descriptor (`artifactId`, media type, digest, size,
+  source nodes, and capture ID). Retrieve its bytes with `design.get_asset`.
+- `coverage`, `omissions`, `pagination`, and `exportStats` make every budget or
+  host limitation observable instead of silently dropping evidence.
+- `captureId` identifies the coherent observable capture. `snapshot` carries
+  the complete normalized baseline identity and revisions. Incremental results
+  use the discriminated `responseType`: `full`, `delta`, `not-modified`, or
+  `resync-required`.
 
 The host-specific escape hatch is `hostData`. It is for useful information that
 does not yet belong in the shared vocabulary; consumers should not depend on it
@@ -64,7 +67,6 @@ All context/export tools accept:
 ```json
 {
   "maxNodes": 1000,
-  "nodeOffset": 0,
   "includeAssets": true,
   "maxAssetBytes": 2000000,
   "includeTokens": true,
@@ -73,9 +75,11 @@ All context/export tools accept:
 ```
 
 The response reports `pagination` and `exportStats`. A caller should continue
-with `pagination.nextOffset` while `hasMore` is true. Asset and token omission
-is observable, so an agent can request a second pass instead of silently
-assuming the first response was complete.
+with the opaque `pagination.nextCursor` while `hasMore` is true. The cursor
+addresses the stored capture and is independent from snapshot unchanged
+checks. Asset, text, token, and response-byte omissions are explicit, so an
+agent can request a bounded second pass instead of silently assuming the first
+response was complete.
 
 ### Detail modes and incremental snapshots
 
@@ -86,14 +90,14 @@ visual styling and embedded assets. The host plugins keep snapshot IDs stable
 for their current plugin session and include the export shape in the ID.
 
 Send a previously returned `snapshot.id` as `knownSnapshotId` to ask whether
-that exact revision and shape is still current. An unchanged response has no
-node payload to merge. Send `changedOnly: true` with an older snapshot ID to
-receive the observed changed nodes; merge those nodes by ID and retain the
-rest of the cached snapshot. Remove IDs in `snapshot.deletedNodeIds`. A
-changed-only response is explicitly `partial`.
-Figma records document-change events. XD records plugin writes and selection
-revisions; external XD edits should be re-read as a complete context when the
-plugin reports a new host state.
+that exact baseline is still compatible. A not-modified response has no node
+payload to merge. Send `changedOnly: true` with an older snapshot ID to receive
+whole-node upserts and top-level `removedNodeIds`; merge those fields by ID and
+retain the rest of the cached complete snapshot. Unknown, evicted, incomplete,
+or incompatible baselines return `resync-required`. Host change events are
+bounded invalidation hints only; both plugins rescan the requested structural
+scope before computing a delta. XD also fingerprints the document at capture
+time so external edits advance freshness even when no plugin write occurred.
 
 ## Semantic audit and graph
 

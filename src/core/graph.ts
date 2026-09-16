@@ -1,9 +1,12 @@
 import { z } from "zod";
 import {
+  captureScopeSchema,
   IR_SCHEMA_VERSION,
+  viewportSchema,
   type ContextIR,
   type DesignIR,
   type DesignNode,
+  type CaptureScope,
 } from "./ir.js";
 
 export const graphComponentSchema = z.object({
@@ -23,22 +26,30 @@ export const graphInteractionSchema = z.object({
   sourceNodeId: z.string().min(1),
   trigger: z.string(),
   action: z.string(),
+  resolutionStatus: z.enum(["resolved", "unresolved", "unknown"]).default("unknown"),
   destinationId: z.string().min(1).optional(),
   url: z.string().optional(),
   navigation: z.string().min(1).optional(),
   transition: z.string().optional(),
+  duration: z.number().finite().nonnegative().optional(),
+  delay: z.number().finite().nonnegative().optional(),
+  easing: z.string().min(1).optional(),
+  direction: z.string().min(1).optional(),
+  matchLayers: z.boolean().optional(),
+  overlayPosition: z.object({ x: z.number().finite(), y: z.number().finite() }).optional(),
+  openInNewTab: z.boolean().optional(),
+  preserveScrollPosition: z.boolean().optional(),
+  resetScrollPosition: z.boolean().optional(),
+  resetInteractiveComponents: z.boolean().optional(),
+  mediaAction: z.string().min(1).optional(),
+  data: z.record(z.string(), z.unknown()).optional(),
 });
 export type GraphInteraction = z.infer<typeof graphInteractionSchema>;
 
 export const graphScreenSchema = z.object({
   id: z.string().min(1),
   name: z.string(),
-  viewport: z.object({
-    width: z.number().finite().positive(),
-    height: z.number().finite().positive(),
-    orientation: z.enum(["portrait", "landscape", "square"]),
-    breakpoint: z.enum(["compact", "medium", "expanded"]),
-  }).optional(),
+  viewport: viewportSchema.optional(),
 });
 export type GraphScreen = z.infer<typeof graphScreenSchema>;
 
@@ -47,8 +58,10 @@ export const designGraphSchema = z.object({
   host: z.enum(["figma", "xd"]),
   documentId: z.string().min(1),
   documentName: z.string(),
-  scope: z.enum(["document", "selection", "screen"]),
+  scope: captureScopeSchema,
   snapshotId: z.string().min(1).optional(),
+  captureId: z.string().min(1),
+  responseType: z.enum(["full", "delta", "not-modified", "resync-required"]),
   partial: z.boolean(),
   components: z.array(graphComponentSchema),
   interactions: z.array(graphInteractionSchema),
@@ -63,8 +76,8 @@ function nodesFor(context: DesignContext): DesignNode[] {
   return Array.isArray(context.nodes) ? context.nodes : Object.values(context.nodes);
 }
 
-function scopeFor(context: DesignContext): "document" | "selection" | "screen" {
-  return "scope" in context ? context.scope : "document";
+function scopeFor(context: DesignContext): CaptureScope {
+  return "scope" in context && context.scope ? context.scope : "document";
 }
 
 export function buildDesignGraph(context: DesignContext): DesignGraph {
@@ -90,10 +103,23 @@ export function buildDesignGraph(context: DesignContext): DesignGraph {
         sourceNodeId: node.id,
         trigger: link.trigger,
         action: link.action,
+        resolutionStatus: link.resolutionStatus,
         ...(link.destinationId ? { destinationId: link.destinationId } : {}),
         ...(link.url ? { url: link.url } : {}),
         ...(link.navigation ? { navigation: link.navigation } : {}),
         ...(link.transition ? { transition: link.transition } : {}),
+        ...(link.duration !== undefined ? { duration: link.duration } : {}),
+        ...(link.delay !== undefined ? { delay: link.delay } : {}),
+        ...(link.easing ? { easing: link.easing } : {}),
+        ...(link.direction ? { direction: link.direction } : {}),
+        ...(link.matchLayers !== undefined ? { matchLayers: link.matchLayers } : {}),
+        ...(link.overlayPosition ? { overlayPosition: link.overlayPosition } : {}),
+        ...(link.openInNewTab !== undefined ? { openInNewTab: link.openInNewTab } : {}),
+        ...(link.preserveScrollPosition !== undefined ? { preserveScrollPosition: link.preserveScrollPosition } : {}),
+        ...(link.resetScrollPosition !== undefined ? { resetScrollPosition: link.resetScrollPosition } : {}),
+        ...(link.resetInteractiveComponents !== undefined ? { resetInteractiveComponents: link.resetInteractiveComponents } : {}),
+        ...(link.mediaAction ? { mediaAction: link.mediaAction } : {}),
+        ...(link.data ? { data: link.data } : {}),
       });
     });
   });
@@ -121,6 +147,7 @@ export function buildDesignGraph(context: DesignContext): DesignGraph {
               : bounds.width < 1024
                 ? "medium" as const
                 : "expanded" as const,
+            breakpointSource: "heuristic" as const,
           }
         : undefined;
       screens.push({ id: screenNode.id, name: screenNode.name, ...(viewport ? { viewport } : {}) });
@@ -134,7 +161,11 @@ export function buildDesignGraph(context: DesignContext): DesignGraph {
     documentName: context.documentName,
     scope: scopeFor(context),
     ...(context.snapshot?.id ? { snapshotId: context.snapshot.id } : {}),
-    partial: context.partial === true || context.pagination?.hasMore === true,
+    captureId: context.captureId,
+    responseType: context.responseType,
+    partial: context.responseType === "delta"
+      || context.pagination?.hasMore === true
+      || Object.values(context.coverage).some((entry) => entry.status !== "complete"),
     components,
     interactions,
     screens,

@@ -6,6 +6,7 @@ import {
   exportOptionsSchema,
   screenSpecSchema,
   hostKindSchema,
+  captureScopeSchema,
   type HostKind,
   visualContextSchema,
 } from "../core/ir.js";
@@ -17,20 +18,32 @@ import { buildDesignGraph, designGraphSchema } from "../core/graph.js";
 
 const hostInput = z.object({
   host: hostKindSchema.optional(),
+  sessionId: z.string().min(1).optional(),
+  documentId: z.string().min(1).optional(),
 });
 
 const screenInput = screenSpecSchema.extend({
   host: hostKindSchema.optional(),
-});
+  sessionId: z.string().min(1).optional(),
+  documentId: z.string().min(1).optional(),
+  expectedSnapshotId: z.string().min(1),
+}).strict();
 
 const componentInput = componentSpecSchema.extend({
   host: hostKindSchema.optional(),
-});
+  sessionId: z.string().min(1).optional(),
+  documentId: z.string().min(1).optional(),
+  expectedSnapshotId: z.string().min(1),
+}).strict();
 
 const updateSelectionInput = z.object({
   host: hostKindSchema.optional(),
+  sessionId: z.string().min(1).optional(),
+  documentId: z.string().min(1).optional(),
   patch: designPatchSchema,
-});
+  targetIds: z.array(z.string().min(1)).min(1).max(2000),
+  expectedSnapshotId: z.string().min(1),
+}).strict();
 
 const screenContextInput = hostInput.extend({
   screenId: z.string().min(1).optional(),
@@ -42,14 +55,17 @@ const selectionContextInput = hostInput.extend({
 });
 
 const exportInput = hostInput.extend({
-  scope: z.enum(["document", "selection", "screen"]).default("document"),
+  scope: captureScopeSchema.default("document"),
   screenId: z.string().min(1).optional(),
   ...exportOptionsSchema.shape,
 });
 
 const visualInput = hostInput.extend({
-  scope: z.enum(["selection", "screen"]).default("screen"),
+  scope: z.enum(["selection", "screen", "page"]).default("screen"),
   screenId: z.string().min(1).optional(),
+  pageId: z.string().min(1).optional(),
+  maxImagePixels: z.number().int().positive().max(100000000).default(8000000),
+  maxImageBytes: z.number().int().positive().max(50000000).default(12000000),
 });
 
 const designContextInput = visualInput.extend({
@@ -58,17 +74,33 @@ const designContextInput = visualInput.extend({
 });
 
 const exportContextInput = hostInput.extend({
-  scope: z.enum(["document", "selection", "screen"]).default("screen"),
+  scope: captureScopeSchema.default("screen"),
   screenId: z.string().min(1).optional(),
   ...exportOptionsSchema.shape,
 });
 
+const assetInput = hostInput.extend({
+  artifactId: z.string().min(1),
+  captureId: z.string().min(1),
+  maxBytes: z.number().int().positive().max(50000000).default(4000000),
+  kind: z.enum(["original", "rendered"]).default("original"),
+});
+
+const operationStatusInput = hostInput.extend({
+  pendingId: z.string().min(1),
+});
+
 function jsonResult(value: unknown) {
+  const structuredContent = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : { value };
   return {
+    structuredContent,
     content: [
       {
         type: "text" as const,
         text: JSON.stringify(value, null, 2),
+        annotations: { audience: ["assistant" as const] },
       },
     ],
   };
@@ -76,22 +108,21 @@ function jsonResult(value: unknown) {
 
 function errorResult(error: unknown) {
   const normalized = asDesignPortError(error);
+  const structuredContent = {
+    error: {
+      code: normalized.code,
+      message: normalized.message,
+      details: normalized.details,
+    },
+  };
   return {
     isError: true,
+    structuredContent,
     content: [
       {
         type: "text" as const,
-        text: JSON.stringify(
-          {
-            error: {
-              code: normalized.code,
-              message: normalized.message,
-              details: normalized.details,
-            },
-          },
-          null,
-          2,
-        ),
+        text: JSON.stringify(structuredContent, null, 2),
+        annotations: { audience: ["assistant" as const] },
       },
     ],
   };
@@ -104,10 +135,12 @@ function visualResult(value: unknown) {
     items: visual.items.map(({ data: _data, ...item }) => item),
   };
   return {
+    structuredContent: metadata,
     content: [
       {
         type: "text" as const,
         text: JSON.stringify(metadata, null, 2),
+        annotations: { audience: ["assistant" as const] },
       },
       ...visual.items.map((item) => ({
         type: "image" as const,
@@ -118,23 +151,53 @@ function visualResult(value: unknown) {
   };
 }
 
-function resolveHost(bridge: DesignPortBridge, host: HostKind | undefined): HostKind {
-  if (host) return host;
+function resolveHost(
+  bridge: DesignPortBridge,
+  value: HostKind | { host?: HostKind; sessionId?: string; documentId?: string } | undefined,
+): { host?: HostKind; sessionId?: string; documentId?: string } {
+  const selector = typeof value === "string" ? { host: value } : value ?? {};
+  if (selector.sessionId || selector.documentId) return selector;
+  if (selector.host) {
+    const hosts = bridge.listHosts().filter((item) => item.host === selector.host);
+    if (hosts.length === 1) {
+      return {
+        host: selector.host,
+        sessionId: hosts[0]!.sessionId,
+        ...(hosts[0]!.documentId ? { documentId: hosts[0]!.documentId } : {}),
+      };
+    }
+    if (hosts.length === 0) throw new DesignPortError("HOST_NOT_CONNECTED", `No ${selector.host} plugin is connected`);
+    throw new DesignPortError("HOST_SELECTION_REQUIRED", `More than one ${selector.host} session is connected; pass sessionId and documentId`);
+  }
   const hosts = bridge.listHosts();
-  if (hosts.length === 1) return hosts[0]!.host;
+  if (hosts.length === 1) {
+    return {
+      host: hosts[0]!.host,
+      sessionId: hosts[0]!.sessionId,
+      ...(hosts[0]!.documentId ? { documentId: hosts[0]!.documentId } : {}),
+    };
+  }
   if (hosts.length === 0) {
     throw new DesignPortError("HOST_NOT_CONNECTED", "No design host plugin is connected");
   }
   throw new DesignPortError(
     "HOST_SELECTION_REQUIRED",
     "More than one design host is connected; pass host explicitly",
-    { hosts: hosts.map((item) => item.host) },
+  { hosts: hosts.map((item) => ({ host: item.host, sessionId: item.sessionId, documentId: item.documentId })) },
   );
+}
+
+function selectorFor(host: HostKind | undefined, sessionId?: string, documentId?: string) {
+  return {
+    ...(host ? { host } : {}),
+    ...(sessionId ? { sessionId } : {}),
+    ...(documentId ? { documentId } : {}),
+  };
 }
 
 async function callBridge<T>(
   bridge: DesignPortBridge,
-  host: HostKind | undefined,
+  host: { host?: HostKind; sessionId?: string; documentId?: string } | HostKind | undefined,
   operation: string,
   payload: unknown,
 ) {
@@ -148,7 +211,7 @@ async function callBridge<T>(
 export function createMcpServer(bridge: DesignPortBridge): McpServer {
   const server = new McpServer({
     name: "designport",
-    version: "0.3.0",
+    version: "0.4.0",
   });
 
   server.registerTool(
@@ -178,8 +241,8 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
       description: "Return the active plugin capabilities for a design host.",
       inputSchema: hostInput.shape,
     },
-    async ({ host }) =>
-      callBridge(bridge, host, "get_capabilities", {}),
+    async ({ host, sessionId, documentId }) =>
+      callBridge(bridge, selectorFor(host, sessionId, documentId), "get_capabilities", {}),
   );
 
   server.registerTool(
@@ -189,8 +252,8 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
       description: "Return the current selection as DesignIR with summary, structure, or full detail and optional pagination, delta, token, and asset controls.",
       inputSchema: selectionContextInput.shape,
     },
-    async ({ host, ...options }) =>
-      callBridge(bridge, host, "get_selection_context", {
+    async ({ host, sessionId, documentId, ...options }) =>
+      callBridge(bridge, selectorFor(host, sessionId, documentId), "get_selection_context", {
         options: exportOptionsSchema.parse(options),
       }),
   );
@@ -202,8 +265,8 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
       description: "Return one screen/artboard as DesignIR with summary, structure, or full detail and optional pagination, delta, token, and asset controls.",
       inputSchema: screenContextInput.shape,
     },
-    async ({ host, screenId, ...options }) =>
-      callBridge(bridge, host, "get_screen_context", {
+    async ({ host, sessionId, documentId, screenId, ...options }) =>
+      callBridge(bridge, selectorFor(host, sessionId, documentId), "get_screen_context", {
         screenId,
         options: exportOptionsSchema.parse(options),
       }),
@@ -216,10 +279,14 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
       description: "Render the selected node or screen as PNG image content and return its visual metadata.",
       inputSchema: visualInput.shape,
     },
-    async ({ host, scope, screenId }) => {
+    async ({ host, sessionId, documentId, scope, screenId, pageId, maxImagePixels, maxImageBytes }) => {
       try {
-        const adapter = new BridgeHostAdapter(bridge, resolveHost(bridge, host));
-        return visualResult(await adapter.getVisualContext(scope, screenId));
+        const adapter = new BridgeHostAdapter(bridge, resolveHost(bridge, selectorFor(host, sessionId, documentId)));
+        return visualResult(await adapter.getVisualContext(scope, screenId, {
+          ...(pageId ? { pageId } : {}),
+          maxImagePixels,
+          maxImageBytes,
+        }));
       } catch (error) {
         return errorResult(error);
       }
@@ -233,12 +300,39 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
       description: "Export the document, current selection, or one screen as DesignIR with detail modes, pagination, snapshot reuse, changed-only deltas, token, and asset controls.",
       inputSchema: exportInput.shape,
     },
-    async ({ host, scope, screenId, ...options }) =>
-      callBridge(bridge, host, "export_ir", {
+    async ({ host, sessionId, documentId, scope, screenId, ...options }) =>
+      callBridge(bridge, selectorFor(host, sessionId, documentId), "export_ir", {
         scope,
         screenId,
         options: exportOptionsSchema.parse(options),
       }),
+  );
+
+  server.registerTool(
+    "design.get_asset",
+    {
+      title: "Retrieve a captured design asset",
+      description: "Retrieve one bounded original or rendered asset by artifact and capture identity.",
+      inputSchema: assetInput.shape,
+    },
+    async ({ host, sessionId, documentId, artifactId, captureId, maxBytes, kind }) =>
+      callBridge(bridge, selectorFor(host, sessionId, documentId), "get_asset", {
+        artifactId,
+        captureId,
+        maxBytes,
+        kind,
+      }),
+  );
+
+  server.registerTool(
+    "design.get_operation_status",
+    {
+      title: "Read a design write status",
+      description: "Read the status of a queued or completed host write operation.",
+      inputSchema: operationStatusInput.shape,
+    },
+    async ({ host, sessionId, documentId, pendingId }) =>
+      callBridge(bridge, selectorFor(host, sessionId, documentId), "get_operation_status", { pendingId }),
   );
 
   server.registerTool(
@@ -248,9 +342,9 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
       description: "Report deterministic semantic, responsive, interaction, accessibility, and token issues in an exported design context.",
       inputSchema: exportContextInput.shape,
     },
-    async ({ host, scope, screenId, ...options }) => {
+    async ({ host, sessionId, documentId, scope, screenId, ...options }) => {
       try {
-        const adapter = new BridgeHostAdapter(bridge, resolveHost(bridge, host));
+        const adapter = new BridgeHostAdapter(bridge, resolveHost(bridge, selectorFor(host, sessionId, documentId)));
         const snapshot = await adapter.exportIR(
           scope,
           screenId,
@@ -275,9 +369,9 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
       description: "Return component/instance relationships, variant state values, screen viewports, and prototype interaction edges from a design context.",
       inputSchema: exportContextInput.shape,
     },
-    async ({ host, scope, screenId, ...options }) => {
+    async ({ host, sessionId, documentId, scope, screenId, ...options }) => {
       try {
-        const adapter = new BridgeHostAdapter(bridge, resolveHost(bridge, host));
+        const adapter = new BridgeHostAdapter(bridge, resolveHost(bridge, selectorFor(host, sessionId, documentId)));
         const snapshot = await adapter.exportIR(
           scope,
           screenId,
@@ -303,13 +397,31 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
       description: "Return host-neutral DesignIR properties, deterministic audit evidence, local image/vector assets, and a PNG visual reference together so an agent can reconstruct the interface in its own stack. Large snapshots can be paginated and assets/tokens can be limited.",
       inputSchema: designContextInput.shape,
     },
-    async ({ host, scope, screenId, includeAudit, ...options }) => {
+    async ({ host, sessionId, documentId, scope, screenId, pageId, maxImagePixels, maxImageBytes, includeAudit, ...options }) => {
       try {
-        const adapter = new BridgeHostAdapter(bridge, resolveHost(bridge, host));
+        const adapter = new BridgeHostAdapter(bridge, resolveHost(bridge, selectorFor(host, sessionId, documentId)));
         const normalizedOptions = exportOptionsSchema.parse(options);
-        const snapshot = await adapter.exportIR(scope, screenId, normalizedOptions);
-        const visual = await adapter.getVisualContext(scope, screenId);
-        const audit = includeAudit && snapshot.unchanged !== true
+        if (pageId) normalizedOptions.pageId = pageId;
+        let snapshot;
+        let visual;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          snapshot = await adapter.exportIR(scope, screenId, normalizedOptions);
+          visual = await adapter.getVisualContext(scope, screenId, {
+            ...(pageId ? { pageId } : {}),
+            maxImagePixels,
+            maxImageBytes,
+          });
+          if (visual.captureId === snapshot.captureId) break;
+          if (attempt === 1) {
+            throw new DesignPortError(
+              "CAPTURE_INCONSISTENT",
+              "Properties and visual evidence were captured from different host states",
+              { propertyCaptureId: snapshot.captureId, visualCaptureId: visual.captureId, attempts: 2 },
+            );
+          }
+        }
+        if (!snapshot || !visual) throw new DesignPortError("CAPTURE_INCONSISTENT", "Host did not return a complete combined capture");
+        const audit = includeAudit && snapshot.responseType !== "not-modified"
           ? designAuditSchema.parse(auditDesignContext(snapshot))
           : undefined;
         const content = [
@@ -345,8 +457,8 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
       description: "Create an artboard/screen through the active design host adapter.",
       inputSchema: screenInput.shape,
     },
-    async ({ host, ...spec }) =>
-      callBridge(bridge, host, "create_screen", spec),
+    async ({ host, sessionId, documentId, ...spec }) =>
+      callBridge(bridge, selectorFor(host, sessionId, documentId), "create_screen", spec),
   );
 
   server.registerTool(
@@ -356,8 +468,8 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
       description: "Create a component or symbol through the active host adapter.",
       inputSchema: componentInput.shape,
     },
-    async ({ host, ...spec }) =>
-      callBridge(bridge, host, "create_component", spec),
+    async ({ host, sessionId, documentId, ...spec }) =>
+      callBridge(bridge, selectorFor(host, sessionId, documentId), "create_component", spec),
   );
 
   server.registerTool(
@@ -367,8 +479,14 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
       description: "Apply a normalized patch to the current host selection.",
       inputSchema: updateSelectionInput.shape,
     },
-    async ({ host, patch }) =>
-      callBridge(bridge, host, "update_selection", { patch }),
+    async ({ host, sessionId, documentId, patch, targetIds, expectedSnapshotId }) =>
+      callBridge(bridge, selectorFor(host, sessionId, documentId), "update_selection", {
+        patch,
+        targetIds,
+        expectedSnapshotId,
+        ...(documentId ? { documentId } : {}),
+        ...(sessionId ? { sessionId } : {}),
+      }),
   );
 
   server.registerTool(
@@ -378,7 +496,7 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
       description: "Check that the selected plugin can receive bridge requests.",
       inputSchema: hostInput.shape,
     },
-    async ({ host }) => callBridge(bridge, host, "ping", {}),
+    async ({ host, sessionId, documentId }) => callBridge(bridge, selectorFor(host, sessionId, documentId), "ping", {}),
   );
 
   return server;

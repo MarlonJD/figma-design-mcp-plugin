@@ -53,7 +53,7 @@ Use both layers in the same reasoning pass:
 ```
 
 For a large screen, request a bounded first page and continue with the returned
-offset:
+cursor:
 
 ```json
 {
@@ -71,9 +71,9 @@ offset:
 ```
 
 If `properties.pagination.hasMore` is `true`, call the same tool with
-`nodeOffset` set to `properties.pagination.nextOffset`. Use
-`properties.exportStats` to see how many assets and tokens were actually
-returned.
+`cursor` set to `properties.pagination.nextCursor`. Use
+`properties.exportStats` and `properties.omissions` to see how many assets and
+tokens were actually returned and why anything was omitted.
 
 For a fast first pass, request only the structural evidence:
 
@@ -113,9 +113,9 @@ same export without receiving all nodes again:
 }
 ```
 
-When the revision is unchanged, the response contains `unchanged: true` and
-an empty node collection. After the design changes, use the same snapshot as a
-baseline and request a delta:
+When the revision is unchanged, the response contains
+`responseType: "not-modified"` and an empty node collection. After the design
+changes, use the same snapshot as a baseline and request a delta:
 
 ```json
 {
@@ -132,9 +132,10 @@ baseline and request a delta:
 }
 ```
 
-Merge `nodes` by ID and remove any IDs in `properties.snapshot.deletedNodeIds`.
-A changed-only or paginated response is marked `partial: true`; it does not
-replace the complete cached context.
+Merge whole-node `nodes` by ID and remove any IDs in
+`properties.removedNodeIds`. If the response is `resync-required`, discard the
+cached baseline and request a fresh full capture. A changed-only or paginated
+response must not replace the complete cached context.
 
 ## Read a selection
 

@@ -1,3 +1,4 @@
+import { z } from "zod";
 import {
   componentSpecSchema,
   contextIRSchema,
@@ -17,22 +18,32 @@ import {
   type ScreenSpec,
   visualContextSchema,
 } from "./ir.js";
-import { DesignPortBridge } from "../bridge/bridge-server.js";
+import { DesignPortBridge, type HostSelector } from "../bridge/bridge-server.js";
 
 export interface DesignHostAdapter {
-  readonly host: HostKind;
+  readonly host: HostKind | HostSelector;
   getCapabilities(): Promise<HostCapabilities>;
   getSelectionContext(options?: Partial<ExportOptions>): Promise<ContextIR>;
   getScreenContext(screenId?: string, options?: Partial<ExportOptions>): Promise<ContextIR>;
-  getVisualContext(scope: "selection" | "screen", screenId?: string): Promise<VisualContext>;
+  getVisualContext(
+    scope: "selection" | "screen" | "page",
+    screenId?: string,
+    options?: { pageId?: string; maxImagePixels?: number; maxImageBytes?: number },
+  ): Promise<VisualContext>;
   exportIR(
-    scope: "document" | "selection" | "screen",
+    scope: "document" | "page" | "selection" | "screen",
     screenId?: string,
     options?: Partial<ExportOptions>,
   ): Promise<DesignIR | ContextIR>;
-  createScreen(spec: ScreenSpec): Promise<unknown>;
-  createComponent(spec: ComponentSpec): Promise<unknown>;
-  updateSelection(patch: DesignPatch): Promise<unknown>;
+  createScreen(spec: ScreenSpec & { expectedSnapshotId: string }): Promise<unknown>;
+  createComponent(spec: ComponentSpec & { expectedSnapshotId: string }): Promise<unknown>;
+  updateSelection(payload: {
+    patch: DesignPatch;
+    targetIds: string[];
+    expectedSnapshotId: string;
+    documentId?: string;
+    sessionId?: string;
+  }): Promise<unknown>;
 }
 
 function optionsPayload(options?: Partial<ExportOptions>): { options: ExportOptions } {
@@ -42,69 +53,76 @@ function optionsPayload(options?: Partial<ExportOptions>): { options: ExportOpti
 export class BridgeHostAdapter implements DesignHostAdapter {
   constructor(
     private readonly bridge: DesignPortBridge,
-    readonly host: HostKind,
+    readonly host: HostKind | HostSelector,
   ) {}
 
   async getCapabilities(): Promise<HostCapabilities> {
-    return hostCapabilitiesSchema.parse(
-      await this.bridge.request(this.host, "get_capabilities", {}),
-    );
+    return hostCapabilitiesSchema.parse(await this.bridge.request(this.host, "get_capabilities", {}));
   }
 
   async getSelectionContext(options?: Partial<ExportOptions>): Promise<ContextIR> {
-    return contextIRSchema.parse(
-      await this.bridge.request(this.host, "get_selection_context", optionsPayload(options)),
-    );
+    return contextIRSchema.parse(await this.bridge.request(
+      this.host,
+      "get_selection_context",
+      optionsPayload(options),
+    ));
   }
 
   async getScreenContext(screenId?: string, options?: Partial<ExportOptions>): Promise<ContextIR> {
-    const payload = {
-      ...(screenId ? { screenId } : {}),
-      ...optionsPayload(options),
-    };
-    return contextIRSchema.parse(
-      await this.bridge.request(this.host, "get_screen_context", payload),
-    );
+    const payload = { ...(screenId ? { screenId } : {}), ...optionsPayload(options) };
+    return contextIRSchema.parse(await this.bridge.request(this.host, "get_screen_context", payload));
   }
 
   async getVisualContext(
-    scope: "selection" | "screen",
+    scope: "selection" | "screen" | "page",
     screenId?: string,
+    options?: { pageId?: string; maxImagePixels?: number; maxImageBytes?: number },
   ): Promise<VisualContext> {
     const payload = {
       scope,
       ...(screenId ? { screenId } : {}),
+      ...(options?.pageId ? { pageId: options.pageId } : {}),
+      ...(options?.maxImagePixels ? { maxImagePixels: options.maxImagePixels } : {}),
+      ...(options?.maxImageBytes ? { maxImageBytes: options.maxImageBytes } : {}),
     };
-    return visualContextSchema.parse(
-      await this.bridge.request(this.host, "get_visual_context", payload),
-    );
+    return visualContextSchema.parse(await this.bridge.request(this.host, "get_visual_context", payload));
   }
 
   async exportIR(
-    scope: "document" | "selection" | "screen",
+    scope: "document" | "page" | "selection" | "screen",
     screenId?: string,
     options?: Partial<ExportOptions>,
   ): Promise<DesignIR | ContextIR> {
+    const normalizedOptions = exportOptionsSchema.parse(options ?? {});
     const payload = {
       scope,
       ...(screenId ? { screenId } : {}),
-      ...optionsPayload(options),
+      ...(normalizedOptions.pageId ? { pageId: normalizedOptions.pageId } : {}),
+      options: normalizedOptions,
     };
     const result = await this.bridge.request(this.host, "export_ir", payload);
     return scope === "document" ? designIRSchema.parse(result) : contextIRSchema.parse(result);
   }
 
-  async createScreen(spec: ScreenSpec): Promise<unknown> {
-    return this.bridge.request(this.host, "create_screen", screenSpecSchema.parse(spec));
+  async createScreen(spec: ScreenSpec & { expectedSnapshotId: string }): Promise<unknown> {
+    return this.bridge.request(this.host, "create_screen", screenSpecSchema.extend({
+      expectedSnapshotId: z.string().min(1),
+    }).parse(spec));
   }
 
-  async createComponent(spec: ComponentSpec): Promise<unknown> {
-    return this.bridge.request(this.host, "create_component", componentSpecSchema.parse(spec));
+  async createComponent(spec: ComponentSpec & { expectedSnapshotId: string }): Promise<unknown> {
+    return this.bridge.request(this.host, "create_component", componentSpecSchema.extend({
+      expectedSnapshotId: z.string().min(1),
+    }).parse(spec));
   }
 
-  async updateSelection(patch: DesignPatch): Promise<unknown> {
-    return this.bridge.request(this.host, "update_selection", {
-      patch: designPatchSchema.parse(patch),
-    });
+  async updateSelection(payload: {
+    patch: DesignPatch;
+    targetIds: string[];
+    expectedSnapshotId: string;
+    documentId?: string;
+    sessionId?: string;
+  }): Promise<unknown> {
+    return this.bridge.request(this.host, "update_selection", payload);
   }
 }

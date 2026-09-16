@@ -20,7 +20,8 @@ const bridge = new DesignPortBridge({
   host: process.env.DESIGNPORT_HOST ?? "127.0.0.1",
   port: portValue,
   requestTimeoutMs: timeoutValue,
-  serverVersion: "0.3.0",
+  serverVersion: "0.4.0",
+  pairingToken: process.env.DESIGNPORT_PAIRING_TOKEN ?? "designport-local-pairing",
 });
 
 const address = await bridge.start();

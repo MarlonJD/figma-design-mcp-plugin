@@ -6,8 +6,13 @@ const application = require("application");
 const { Artboard, Rectangle, Text, Color } = scenegraph;
 
 const BRIDGE_URL = "ws://127.0.0.1:5514";
-const PLUGIN_VERSION = "0.3.0";
+const BRIDGE_PROTOCOL_VERSION = 2;
+const PLUGIN_VERSION = "0.4.0";
+const PAIRING_TOKEN = "designport-local-pairing";
 const MAX_ASSET_EXPORTS_PER_REQUEST = 64;
+const MAX_PENDING_WRITES = 32;
+const WRITE_TTL_MS = 60_000;
+const MAX_ASSET_CACHE_BYTES = 32_000_000;
 
 const CAPABILITIES = {
   host: "xd",
@@ -23,6 +28,8 @@ const CAPABILITIES = {
     "asset-export",
     "pagination",
     "incremental-snapshots",
+    "bounded-asset-retrieval",
+    "capture-consistency",
   ],
   limitations: [
     "component-creation-unsupported",
@@ -36,8 +43,9 @@ const CAPABILITIES = {
     "get_screen_context",
     "get_visual_context",
     "export_ir",
+    "get_asset",
+    "get_operation_status",
     "create_screen",
-    "create_component",
     "update_selection",
   ],
   supports: {
@@ -53,23 +61,35 @@ const CAPABILITIES = {
 
 const DEFAULT_EXPORT_OPTIONS = {
   maxNodes: 5000,
-  nodeOffset: 0,
+  cursor: undefined,
   includeAssets: true,
   maxAssetBytes: 4000000,
   includeTokens: true,
   detail: "full",
   changedOnly: false,
+  includePages: false,
+  maxTextBytes: 200000,
+  maxTokenRecords: 5000,
+  maxImagePixels: 8000000,
+  maxResponseBytes: 12000000,
 };
 
 const assetCache = new Map();
 const assetPromises = new Map();
+let assetCacheBytes = 0;
 const snapshotState = {
   sessionId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
   documentRevision: 0,
   selectionRevision: 0,
   selectionKey: "",
+  documentSignature: "",
   changeLog: [],
   snapshots: new Map(),
+  evictedSnapshotIds: new Set(),
+  generation: 0,
+  eventSequence: 0,
+  assets: new Map(),
+  cursors: new Map(),
 };
 
 const state = {
@@ -79,6 +99,7 @@ const state = {
   pendingNode: null,
   applyButton: null,
   pendingWrites: [],
+  writeStatuses: new Map(),
   reconnectTimer: null,
 };
 
@@ -107,9 +128,9 @@ function exportOptionsFor(payload) {
     maxNodes: Number.isInteger(input.maxNodes) && input.maxNodes > 0
       ? Math.min(10000, input.maxNodes)
       : DEFAULT_EXPORT_OPTIONS.maxNodes,
-    nodeOffset: Number.isInteger(input.nodeOffset) && input.nodeOffset >= 0
-      ? Math.min(1000000, input.nodeOffset)
-      : DEFAULT_EXPORT_OPTIONS.nodeOffset,
+    ...(typeof input.cursor === "string" && input.cursor.trim()
+      ? { cursor: input.cursor.trim() }
+      : {}),
     includeAssets: input.includeAssets !== false,
     maxAssetBytes: Number.isInteger(input.maxAssetBytes) && input.maxAssetBytes > 0
       ? Math.min(50000000, input.maxAssetBytes)
@@ -122,6 +143,20 @@ function exportOptionsFor(payload) {
       ? { knownSnapshotId: input.knownSnapshotId.trim() }
       : {}),
     changedOnly: input.changedOnly === true,
+    pageId: typeof input.pageId === "string" && input.pageId.trim() ? input.pageId.trim() : undefined,
+    includePages: input.includePages === true,
+    maxTextBytes: Number.isInteger(input.maxTextBytes) && input.maxTextBytes > 0
+      ? Math.min(50000000, input.maxTextBytes)
+      : DEFAULT_EXPORT_OPTIONS.maxTextBytes,
+    maxTokenRecords: Number.isInteger(input.maxTokenRecords) && input.maxTokenRecords > 0
+      ? Math.min(100000, input.maxTokenRecords)
+      : DEFAULT_EXPORT_OPTIONS.maxTokenRecords,
+    maxImagePixels: Number.isInteger(input.maxImagePixels) && input.maxImagePixels > 0
+      ? Math.min(100000000, input.maxImagePixels)
+      : DEFAULT_EXPORT_OPTIONS.maxImagePixels,
+    maxResponseBytes: Number.isInteger(input.maxResponseBytes) && input.maxResponseBytes > 0
+      ? Math.min(100000000, input.maxResponseBytes)
+      : DEFAULT_EXPORT_OPTIONS.maxResponseBytes,
   };
 }
 
@@ -151,59 +186,132 @@ function syncSelectionRevision() {
   rememberChangedNodeIds(items.map((item) => nodeId(item)));
 }
 
-function snapshotFor(scope, screenId, options) {
-  syncSelectionRevision();
-  const info = documentInfo();
-  const optionKey = [
-    options.detail,
-    options.includeAssets,
-    options.maxAssetBytes,
-    options.includeTokens,
-  ].join(":");
-  const id = [
-    snapshotState.sessionId,
-    info.documentId,
-    snapshotState.documentRevision,
-    snapshotState.selectionRevision,
-    scope,
-    screenId || "",
-    optionKey,
-  ].join("|");
-  const known = options.knownSnapshotId
-    ? snapshotState.snapshots.get(options.knownSnapshotId)
-    : undefined;
-  const changedNodeIds = new Set();
-  const deletedNodeIds = new Set();
-  snapshotState.changeLog.forEach((change) => {
-    if (!known
-      || change.documentRevision > known.documentRevision
-      || change.selectionRevision > known.selectionRevision) {
-      change.ids.forEach((nodeId) => changedNodeIds.add(nodeId));
-      change.deletedIds.forEach((nodeId) => deletedNodeIds.add(nodeId));
+function documentSignature() {
+  const entries = [];
+  const pending = [{ node: scenegraph.root, parentId: null }];
+  while (pending.length) {
+    const current = pending.pop();
+    const children = childrenOf(current.node);
+    entries.push({
+      id: nodeId(current.node),
+      parentId: current.parentId || null,
+      children: children.map((child) => nodeId(child)),
+      name: current.node && current.node.name,
+      visible: current.node && current.node.visible !== false,
+      bounds: boundsOf(current.node),
+      text: nodeKind(current.node) === "text" ? current.node.text : undefined,
+    });
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      pending.push({ node: children[index], parentId: nodeId(current.node) });
     }
-  });
-  deletedNodeIds.forEach((nodeId) => changedNodeIds.delete(nodeId));
-  const snapshot = {
-    id,
+  }
+  return hashValue(entries);
+}
+
+function syncDocumentRevision() {
+  const signature = documentSignature();
+  if (!snapshotState.documentSignature) {
+    snapshotState.documentSignature = signature;
+    return;
+  }
+  if (signature === snapshotState.documentSignature) return;
+  snapshotState.documentSignature = signature;
+  snapshotState.documentRevision += 1;
+  rememberChangedNodeIds([]);
+  clearAssetCache();
+}
+
+function stableValue(value) {
+  if (Array.isArray(value)) return `[${value.map(stableValue).join(",")}]`;
+  if (!value || typeof value !== "object") return JSON.stringify(value);
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableValue(value[key])}`).join(",")}}`;
+}
+
+function hashValue(value) {
+  let hash = 2166136261;
+  const text = typeof value === "string" ? value : stableValue(value);
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function captureShape(options) {
+  return {
+    detail: options.detail,
+    includeAssets: options.includeAssets,
+    includeTokens: options.includeTokens,
+    maxAssetBytes: options.maxAssetBytes,
+    maxTextBytes: options.maxTextBytes,
+    maxTokenRecords: options.maxTokenRecords,
+  };
+}
+
+function captureIdentity(scope, pageId, rootIds, selectedIds, options) {
+  const info = documentInfo();
+  return {
+    sessionId: snapshotState.sessionId,
+    documentId: info.documentId,
     scope,
+    ...(pageId ? { pageId } : {}),
+    scopeRootIds: Array.from(new Set(rootIds.filter(Boolean))),
+    selectedIds: Array.from(new Set(selectedIds.filter(Boolean))),
+    normalizationVersion: "designport-ir-v2",
+    evidenceShape: captureShape(options),
+  };
+}
+
+function captureIdFor(identity, entries) {
+  const observable = entries.map((entry) => ({
+    id: nodeId(entry.node),
+    parentId: entry.parentId || null,
+    children: childrenOf(entry.node).map((child) => nodeId(child)),
+    name: entry.node.name,
+    visible: entry.node.visible !== false,
+    bounds: boundsOf(entry.node),
+    text: nodeKind(entry.node) === "text" ? entry.node.text : undefined,
+  }));
+  return `capture-${hashValue({
+    identity: { ...identity, evidenceShape: undefined },
     documentRevision: snapshotState.documentRevision,
     selectionRevision: snapshotState.selectionRevision,
-    ...(screenId ? { screenId } : {}),
-    ...(changedNodeIds.size
-      ? { changedNodeIds: Array.from(changedNodeIds).slice(-2000) }
-      : {}),
-    ...(deletedNodeIds.size
-      ? { deletedNodeIds: Array.from(deletedNodeIds).slice(-2000) }
-      : {}),
+    observable,
+  })}`;
+}
+
+function snapshotFor(identity, captureId, fingerprint, nodes, tokens, complete) {
+  const id = `snapshot-${hashValue({ identity, fingerprint })}`;
+  const snapshot = {
+    id,
+    captureId,
+    identity,
+    scope: identity.scope,
+    documentRevision: snapshotState.documentRevision,
+    selectionRevision: snapshotState.selectionRevision,
+    generation: ++snapshotState.generation,
+    complete,
     generatedAt: new Date().toISOString(),
   };
   snapshotState.snapshots.set(id, {
-    documentRevision: snapshot.documentRevision,
-    selectionRevision: snapshot.selectionRevision,
+    snapshot,
+    identity,
+    captureId,
+    fingerprint,
+    nodes,
+    tokens,
   });
-  if (snapshotState.snapshots.size > 128) {
+  while (snapshotState.snapshots.size > 128) {
     const first = snapshotState.snapshots.keys().next().value;
-    if (first) snapshotState.snapshots.delete(first);
+    if (!first) break;
+    const evicted = snapshotState.snapshots.get(first);
+    snapshotState.snapshots.delete(first);
+    snapshotState.evictedSnapshotIds.add(first);
+    if (evicted && !Array.from(snapshotState.snapshots.values()).some((item) => item.captureId === evicted.captureId)) {
+      for (const [artifactId, asset] of snapshotState.assets) {
+        if (asset.captureId === evicted.captureId) snapshotState.assets.delete(artifactId);
+      }
+    }
   }
   return snapshot;
 }
@@ -212,6 +320,7 @@ function nodeForDetail(node, detail) {
   if (detail === "full") return node;
   const summaryKeys = new Set([
     "id", "name", "kind", "parentId", "children", "bounds", "renderBounds",
+    "localBounds", "worldBounds",
     "visible", "locked", "description", "rotation", "transform", "clipsContent",
     "minWidth", "maxWidth", "minHeight", "maxHeight", "constraints", "layoutAlign",
     "layoutGrow", "layoutPositioning", "gridPosition", "layout", "hostData",
@@ -219,7 +328,7 @@ function nodeForDetail(node, detail) {
   const structureKeys = new Set([
     ...summaryKeys,
     "styleRefs", "variableBindings", "component", "accessibility", "annotations",
-    "text", "textSegments", "typography", "prototypeLinks",
+    "text", "textSegments", "typography", "prototypeLinks", "untrustedText", "provenance",
   ]);
   const keys = detail === "summary" ? summaryKeys : structureKeys;
   return Object.fromEntries(Object.entries(node).filter(([key]) => keys.has(key)));
@@ -232,6 +341,11 @@ function exportStateFor(options) {
     assetCount: 0,
     assetBytes: 0,
     assetsOmitted: 0,
+    textBytes: 0,
+    tokenRecords: 0,
+    tokenBudgetExceeded: false,
+    imagePixels: 0,
+    omissions: [],
   };
 }
 
@@ -305,6 +419,14 @@ function boxFrom(value) {
 
 function boundsOf(node) {
   return boxFrom(node && (node.globalBounds || node.localBounds));
+}
+
+function localBoundsOf(node) {
+  return boxFrom(node && node.localBounds);
+}
+
+function worldBoundsOf(node) {
+  return boxFrom(node && node.globalBounds);
 }
 
 function renderBoundsOf(node) {
@@ -540,7 +662,16 @@ function typographyFromXD(value, fallback) {
   else if (font && typeof font.style === "string") typography.style = font.style;
   if (Number.isFinite(source.fontSize) && source.fontSize > 0) typography.size = source.fontSize;
   if (Number.isFinite(source.fontWeight) && source.fontWeight > 0) typography.weight = source.fontWeight;
-  if (Number.isFinite(source.charSpacing)) typography.letterSpacing = source.charSpacing;
+  const characterSpacing = Number.isFinite(source.charSpacing)
+    ? source.charSpacing
+    : Number.isFinite(source.characterSpacing)
+      ? source.characterSpacing
+      : undefined;
+  if (characterSpacing !== undefined) {
+    typography.letterSpacing = typography.size
+      ? typography.size * characterSpacing / 1000
+      : characterSpacing / 1000;
+  }
   if (Number.isFinite(source.lineHeight) && source.lineHeight > 0) typography.lineHeight = source.lineHeight;
   else if (Number.isFinite(source.lineSpacing) && source.lineSpacing > 0) typography.lineHeight = source.lineSpacing;
   const align = textAlignFor(source.textAlign || source.textAlignHorizontal);
@@ -682,16 +813,28 @@ function layoutPositioningFor(node) {
 }
 
 function constraintFor(value, axis) {
-  const normalized = normalizeMode(value);
-  if (normalized.includes("LEFT_RIGHT") || normalized.includes("TOP_BOTTOM") || normalized === "BOTH") {
-    return axis === "horizontal" ? "left-right" : "top-bottom";
+  const sources = value && typeof value === "object"
+    ? [value.position, value.anchor, value.type, value.mode, value.value, value.name, value.constraint, value.size, value.sizing]
+    : [value];
+  for (const source of sources) {
+    const normalized = normalizeMode(source);
+    if (normalized.includes("LEFT_RIGHT") || normalized.includes("TOP_BOTTOM") || normalized === "BOTH") {
+      return axis === "horizontal" ? "left-right" : "top-bottom";
+    }
+    if (axis === "horizontal") {
+      if (normalized.includes("LEFT")) return "left";
+      if (normalized.includes("RIGHT")) return "right";
+      if (normalized.includes("CENTER")) return "center";
+    } else {
+      if (normalized.includes("TOP")) return "top";
+      if (normalized.includes("BOTTOM")) return "bottom";
+      if (normalized.includes("CENTER")) return "center";
+    }
+    if (normalized.includes("SCALE")) return "scale";
+    if (normalized.includes("STRETCH") || normalized.includes("FILL") || normalized.includes("RESPONSIVE")) {
+      return axis === "horizontal" ? "left-right" : "top-bottom";
+    }
   }
-  if (normalized.includes("LEFT")) return "left";
-  if (normalized.includes("RIGHT")) return "right";
-  if (normalized.includes("TOP")) return "top";
-  if (normalized.includes("BOTTOM")) return "bottom";
-  if (normalized.includes("CENTER")) return "center";
-  if (normalized.includes("SCALE")) return "scale";
   return undefined;
 }
 
@@ -784,7 +927,7 @@ function variableBindingsFor(node) {
 
 function inferredAccessibilityFor(node) {
   const name = `${node.name || ""} ${nodeType(node)}`.toLowerCase();
-  const headingMatch = name.match(/(?:^|[\s/_-])h([1-6])(?:$|[\s/_-])|(?:^|[\s/_-])heading(?:$|[\s/_-])/);
+  const headingMatch = name.match(/(?:^|[\s_-])h([1-6])(?:$|[\s_-])|(?:^|[\s_-])heading(?:$|[\s_-])/);
   if (headingMatch || nodeKind(node) === "text" && /title|heading/.test(name)) {
     return {
       role: "heading",
@@ -793,14 +936,14 @@ function inferredAccessibilityFor(node) {
     };
   }
   const rolePatterns = [
-    ["button", /button|cta/],
-    ["link", /link|hyperlink/],
-    ["checkbox", /checkbox/],
-    ["switch", /switch|toggle/],
-    ["textbox", /input|textfield|text-field|search/],
-    ["tab", /tab/],
-    ["navigation", /navigation|navbar|nav-bar|bottom-nav/],
-    ["img", /image|photo|avatar|thumbnail/],
+    ["button", /(?:^|[\s_-])(?:button|cta)(?:$|[\s_-])/],
+    ["link", /(?:^|[\s_-])(?:link|hyperlink)(?:$|[\s_-])/],
+    ["checkbox", /(?:^|[\s_-])checkbox(?:$|[\s_-])/],
+    ["switch", /(?:^|[\s_-])(?:switch|toggle)(?:$|[\s_-])/],
+    ["textbox", /(?:^|[\s_-])(?:input|textfield|text-field|search)(?:$|[\s_-])/],
+    ["tab", /(?:^|[\s_-])tab(?:$|[\s_-])/],
+    ["navigation", /(?:^|[\s_-])(?:navigation|navbar|nav-bar|bottom-nav)(?:$|[\s_-])/],
+    ["img", /(?:^|[\s_-])(?:image|photo|avatar|thumbnail)(?:$|[\s_-])/],
   ];
   const match = rolePatterns.find(([, pattern]) => pattern.test(name));
   return match ? { role: match[0], confidence: 0.4 } : undefined;
@@ -825,9 +968,9 @@ function accessibilityFor(node) {
   }
   if (!configured || typeof configured !== "object") configured = {};
   const configuredRole = nonEmptyString(configured.role) || nonEmptyString(pluginDataFor(node, "a11y.role"));
-  const configuredLabel = typeof configured.label === "string" ? configured.label : pluginDataFor(node, "a11y.label");
-  const configuredDescription = typeof configured.description === "string" ? configured.description : pluginDataFor(node, "a11y.description");
-  const configuredAltText = typeof configured.altText === "string" ? configured.altText : pluginDataFor(node, "a11y.altText");
+  const configuredLabel = typeof configured.label === "string" ? configured.label : nonEmptyString(pluginDataFor(node, "a11y.label"));
+  const configuredDescription = typeof configured.description === "string" ? configured.description : nonEmptyString(pluginDataFor(node, "a11y.description"));
+  const configuredAltText = typeof configured.altText === "string" ? configured.altText : nonEmptyString(pluginDataFor(node, "a11y.altText"));
   const configuredHeadingLevel = Number(configured.headingLevel || pluginDataFor(node, "a11y.headingLevel"));
   const configuredFocusable = typeof configured.focusable === "boolean" ? configured.focusable : booleanData(pluginDataFor(node, "a11y.focusable"));
   const configuredDecorative = typeof configured.decorative === "boolean" ? configured.decorative : booleanData(pluginDataFor(node, "a11y.decorative"));
@@ -862,8 +1005,28 @@ function accessibilityFor(node) {
     ...(headingLevel !== undefined ? { headingLevel } : {}),
     ...(configuredFocusable !== undefined ? { focusable: configuredFocusable } : {}),
     ...(configuredDecorative !== undefined ? { decorative: configuredDecorative } : {}),
-    source: explicit ? "explicit" : "inferred",
+    source: configuredRole || configuredLabel !== undefined || configuredDescription !== undefined
+      || configuredAltText !== undefined || configuredFocusable !== undefined || configuredDecorative !== undefined
+      ? "plugin-data" : inferred.role ? "inferred" : "host",
     confidence: explicit ? 1 : inferred.confidence,
+    provenance: {
+      ...(configuredRole
+        ? { role: { source: "plugin-data", sourceField: "designport.accessibility.role" } }
+        : inferred.role
+          ? { role: { source: "inferred", sourceField: "node.name", inferenceRuleVersion: "accessibility-name-v2" } }
+          : {}),
+      ...(configuredLabel !== undefined
+        ? { label: { source: "plugin-data", sourceField: "designport.accessibility.label" } }
+        : label !== undefined
+          ? { label: { source: "inferred", sourceField: "node.text", inferenceRuleVersion: "accessibility-name-v2" } }
+          : {}),
+      ...(description !== undefined
+        ? { description: { source: configuredDescription ? "plugin-data" : "host", sourceField: configuredDescription ? "designport.accessibility.description" : "node.description" } }
+        : {}),
+      ...(configuredAltText !== undefined
+        ? { altText: { source: "plugin-data", sourceField: "designport.accessibility.altText" } }
+        : {}),
+    },
   };
 }
 
@@ -877,6 +1040,7 @@ function annotationsFor(node) {
     ...(Array.isArray(annotation.properties) ? {
       properties: annotation.properties.map((property) => property && property.type).filter((type) => typeof type === "string"),
     } : {}),
+    untrusted: true,
   }));
   return result.length ? result : undefined;
 }
@@ -937,10 +1101,14 @@ function prototypeLinksFor(node) {
         if (triggerObject[key] !== undefined) data[key] = triggerObject[key];
       });
     }
+    const destinationId = nodeId(destination);
     links.push({
       trigger: snakeCase(triggerObject.type || "unknown"),
-      action: actionType || "unknown",
-      ...(nodeId(destination) ? { destinationId: nodeId(destination) } : {}),
+      action: actionType,
+      resolutionStatus: destinationId || typeof action.url === "string"
+        ? "resolved"
+        : /navigate|overlay|swap|back/.test(actionType) ? "unresolved" : "unknown",
+      ...(destinationId ? { destinationId } : {}),
       ...(typeof action.url === "string" ? { url: action.url } : {}),
       ...(actionType.includes("artboard") || actionType.includes("overlay") ? { navigation: "navigate" } : {}),
       ...(typeof transition.type === "string" ? { transition: snakeCase(transition.type) } : {}),
@@ -1044,32 +1212,83 @@ async function createRendition(node, type, extension, index) {
   return file;
 }
 
-async function exportNodeAsset(node, kind) {
+async function removeTemporaryFile(file) {
+  if (!file) return;
   try {
-    const file = await createRendition(node, "SVG", "svg", "asset");
+    if (typeof file.delete === "function") await file.delete();
+    else if (typeof file.remove === "function") await file.remove();
+  } catch (_error) {
+    // Temporary storage cleanup is best effort on older UXP runtimes.
+  }
+}
+
+async function exportNodeAsset(node, kind) {
+  let file;
+  try {
+    file = await createRendition(node, "SVG", "svg", "asset");
     const data = await readText(file);
     if (data && data.trim()) {
-      return { mimeType: "image/svg+xml", data, kind, byteSize: utf8ByteLength(data) };
+      return {
+        mimeType: "image/svg+xml",
+        data,
+        kind,
+        size: utf8ByteLength(data),
+        artifactId: `asset-${hashValue(`${nodeId(node)}|${data}`)}`,
+        digest: hashValue(data),
+        sourceNodeIds: [nodeId(node)],
+      };
     }
   } catch (_error) {
     // Some XD nodes cannot be rendered as SVG; PNG is the safe fallback.
+  } finally {
+    await removeTemporaryFile(file);
+    file = undefined;
   }
   try {
-    const file = await createRendition(node, "PNG", "png", "asset");
+    file = await createRendition(node, "PNG", "png", "asset");
     const bytes = await file.read({ format: formats.binary });
+    const encoded = base64FromArrayBuffer(bytes);
     return {
       mimeType: "image/png",
-      data: base64FromArrayBuffer(bytes),
+      data: encoded,
       kind,
-      byteSize: bytesFromArrayBuffer(bytes).byteLength,
+      size: bytesFromArrayBuffer(bytes).byteLength,
+      artifactId: `asset-${hashValue(`${nodeId(node)}|${encoded}`)}`,
+      digest: hashValue(encoded),
+      sourceNodeIds: [nodeId(node)],
     };
   } catch (_error) {
     return undefined;
+  } finally {
+    await removeTemporaryFile(file);
   }
 }
 
 function assetCacheKey(node) {
-  return `${documentInfo().documentId}:${nodeId(node)}`;
+  return `${snapshotState.sessionId}:${documentInfo().documentId}:${snapshotState.documentRevision}:${snapshotState.generation}:${nodeId(node)}`;
+}
+
+function cacheAsset(key, asset) {
+  if (!asset) return;
+  const size = Number.isFinite(asset.size) ? asset.size : 0;
+  const previous = assetCache.get(key);
+  if (previous) assetCacheBytes -= Number.isFinite(previous.size) ? previous.size : 0;
+  assetCache.delete(key);
+  assetCache.set(key, asset);
+  assetCacheBytes += size;
+  while (assetCacheBytes > MAX_ASSET_CACHE_BYTES && assetCache.size > 1) {
+    const first = assetCache.keys().next().value;
+    if (!first) break;
+    const removed = assetCache.get(first);
+    assetCache.delete(first);
+    assetCacheBytes -= removed && Number.isFinite(removed.size) ? removed.size : 0;
+  }
+}
+
+function clearAssetCache() {
+  assetCache.clear();
+  assetCacheBytes = 0;
+  assetPromises.clear();
 }
 
 async function assetFor(node, exportState) {
@@ -1079,21 +1298,29 @@ async function assetFor(node, exportState) {
   const isImage = imageFillFor(node);
   if (!isVector && !isImage) return undefined;
   const key = assetCacheKey(node);
+  const requestRevision = snapshotState.documentRevision;
   const includeAsset = (asset) => {
     if (!asset) {
       exportState.assetsOmitted += 1;
+      exportState.omissions.push({ kind: "failed", message: "Host could not export this asset.", nodeIds: [nodeId(node)] });
       return undefined;
     }
-    const byteSize = Number.isFinite(asset.byteSize) ? asset.byteSize : 0;
-    if (exportState.assetBytes + byteSize > exportState.options.maxAssetBytes) {
+    const size = Number.isFinite(asset.size) ? asset.size : 0;
+    if (exportState.assetBytes + size > exportState.options.maxAssetBytes) {
       exportState.assetsOmitted += 1;
+      exportState.omissions.push({ kind: "budget", message: "Asset evidence exceeded maxAssetBytes.", nodeIds: [nodeId(node)], artifactId: asset.artifactId });
       return undefined;
     }
     exportState.assetCount += 1;
-    exportState.assetBytes += byteSize;
+    exportState.assetBytes += size;
     return asset;
   };
-  if (assetCache.has(key)) return includeAsset(assetCache.get(key));
+  if (assetCache.has(key)) {
+    const cached = assetCache.get(key);
+    assetCache.delete(key);
+    assetCache.set(key, cached);
+    return includeAsset(cached);
+  }
   const pending = assetPromises.get(key);
   if (pending) return includeAsset(await pending);
   if (exportState.assetExports >= MAX_ASSET_EXPORTS_PER_REQUEST) {
@@ -1105,7 +1332,12 @@ async function assetFor(node, exportState) {
   assetPromises.set(key, promise);
   try {
     const asset = await promise;
-    assetCache.set(key, asset);
+    if (requestRevision !== snapshotState.documentRevision) {
+      exportState.assetsOmitted += 1;
+      exportState.omissions.push({ kind: "failed", message: "Asset export completed after the document changed.", nodeIds: [nodeId(node)] });
+      return undefined;
+    }
+    cacheAsset(key, asset);
     return includeAsset(asset);
   } finally {
     assetPromises.delete(key);
@@ -1124,7 +1356,7 @@ function viewportFor(bounds) {
     : bounds.width < 1024
       ? "medium"
       : "expanded";
-  return { width: bounds.width, height: bounds.height, orientation, breakpoint };
+  return { width: bounds.width, height: bounds.height, orientation, breakpoint, breakpointSource: "heuristic" };
 }
 
 function screenDetailsFor(root) {
@@ -1143,7 +1375,9 @@ async function nodeToIR(node, parentId, topLevel, exportState) {
   const id = nodeId(node);
   if (!id) return null;
   const children = childrenOf(node);
-  const bounds = boundsOf(node);
+  const localBounds = localBoundsOf(node);
+  const worldBounds = worldBoundsOf(node);
+  const bounds = worldBounds || localBounds;
   const renderBounds = renderBoundsOf(node);
   const transform = affineTransformFor(safeRead(() => node.transform, null));
   const fills = safeRead(() => node.fillEnabled === false ? [] : fillsFromXD(node.fill), []);
@@ -1181,6 +1415,8 @@ async function nodeToIR(node, parentId, topLevel, exportState) {
     parentId: parentId || null,
     children: children.map(nodeId).filter(Boolean),
     bounds,
+    ...(localBounds ? { localBounds } : {}),
+    ...(worldBounds ? { worldBounds } : {}),
     ...(renderBounds ? { renderBounds } : {}),
     visible: node.visible !== false,
     ...(typeof node.locked === "boolean" ? { locked: node.locked } : {}),
@@ -1203,10 +1439,19 @@ async function nodeToIR(node, parentId, topLevel, exportState) {
     ...(component ? { component } : {}),
     ...(accessibility ? { accessibility } : {}),
     ...(annotations ? { annotations } : {}),
-    ...(typeof node.text === "string" ? { text: node.text } : {}),
+    ...(typeof node.text === "string" ? { text: node.text, untrustedText: true } : {}),
     ...(textSegments ? { textSegments } : {}),
     ...(typography ? { typography } : {}),
     ...(prototypeLinks ? { prototypeLinks } : {}),
+    provenance: {
+      ...(localBounds ? { localBounds: { source: "host", sourceField: "localBounds" } } : {}),
+      ...(worldBounds ? { worldBounds: { source: "host", sourceField: "globalBounds" } } : {}),
+      ...(transform ? { transform: { source: "host", sourceField: "transform" } } : {}),
+      ...(constraints ? { constraints: { source: "host", sourceField: "horizontalConstraints,verticalConstraints" } } : {}),
+      ...(layout ? { layout: { source: "host", sourceField: "layout" } } : {}),
+      ...(styleRefs ? { styleRefs: { source: "host", sourceField: "styleRefs" } } : {}),
+      ...(variableBindings ? { variableBindings: { source: "plugin-data", sourceField: "designport.variableBindings" } } : {}),
+    },
     hostData,
   }, exportState.options.detail);
 }
@@ -1225,90 +1470,358 @@ function selectionItems() {
 }
 
 function flattenSubtree(node, parentId, topLevel, entries) {
-  entries.push({ node, parentId, topLevel });
-  childrenOf(node).forEach((child) => flattenSubtree(child, nodeId(node), false, entries));
+  const pending = [{ node, parentId, topLevel }];
+  while (pending.length) {
+    const current = pending.pop();
+    entries.push(current);
+    const children = childrenOf(current.node);
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      pending.push({
+        node: children[index],
+        parentId: nodeId(current.node),
+        topLevel: false,
+      });
+    }
+  }
 }
 
-async function serializeEntries(entries, options, snapshot) {
-  const unchanged = options.knownSnapshotId === snapshot.id;
-  const changedIds = options.changedOnly && snapshot.changedNodeIds
-    ? new Set(snapshot.changedNodeIds)
-    : null;
-  const sourceEntries = unchanged
-    ? []
-    : changedIds && changedIds.size
-      ? entries.filter((entry) => changedIds.has(nodeId(entry.node)))
-      : entries;
-  const selected = sourceEntries.slice(options.nodeOffset, options.nodeOffset + options.maxNodes);
+function defaultCoverage(options, exportState, tokens) {
+  return {
+    geometry: { status: "complete" },
+    layout: { status: "complete" },
+    typography: { status: "complete" },
+    tokens: options.includeTokens && options.detail !== "summary"
+      ? { status: exportState.tokenBudgetExceeded ? "partial" : "complete", ...(exportState.tokenBudgetExceeded ? { reason: "Token record budget reached." } : {}) }
+      : { status: "omitted", reason: "Token evidence was not requested for this detail shape." },
+    components: { status: "complete" },
+    interactions: { status: "complete" },
+    assets: options.includeAssets && options.detail === "full"
+      ? { status: exportState.assetsOmitted ? "partial" : "complete", ...(exportState.assetsOmitted ? { reason: "Some asset exports exceeded a budget or were unavailable." } : {}) }
+      : { status: "omitted", reason: "Asset evidence was not requested for this detail shape." },
+    accessibility: { status: "complete" },
+  };
+}
+
+function captureOptionsFor(options) {
+  return {
+    maxNodes: options.maxNodes,
+    includeAssets: options.includeAssets,
+    maxAssetBytes: options.maxAssetBytes,
+    includeTokens: options.includeTokens,
+    detail: options.detail,
+    cursor: undefined,
+    knownSnapshotId: undefined,
+    changedOnly: false,
+    pageId: options.pageId,
+    includePages: options.includePages,
+    maxTextBytes: options.maxTextBytes,
+    maxTokenRecords: options.maxTokenRecords,
+    maxImagePixels: options.maxImagePixels,
+    maxResponseBytes: options.maxResponseBytes,
+  };
+}
+
+async function materializeEntries(entries, identity, options) {
+  syncDocumentRevision();
+  syncSelectionRevision();
   const exportState = exportStateFor(options);
   const nodes = [];
-  for (const entry of selected) {
+  for (const entry of entries) {
     const node = await nodeToIR(entry.node, entry.parentId, entry.topLevel, exportState);
-    if (node) nodes.push(node);
+    if (!node) continue;
+    if (typeof node.text === "string") {
+      exportState.textBytes += utf8ByteLength(node.text);
+      if (exportState.textBytes > options.maxTextBytes) {
+        delete node.text;
+        delete node.untrustedText;
+        delete node.textSegments;
+        exportState.omissions.push({ kind: "budget", message: "Text evidence exceeded maxTextBytes.", nodeIds: [node.id] });
+      }
+    }
+    nodes.push(node);
   }
-  const hasMore = options.nodeOffset + nodes.length < sourceEntries.length;
-  const partial = !unchanged && (
-    Boolean(options.changedOnly && changedIds && changedIds.size)
-    || options.nodeOffset > 0
-    || hasMore
-    || sourceEntries.length < entries.length
+  let tokens = await tokenCatalog(options);
+  if (tokens.length > options.maxTokenRecords) {
+    exportState.tokenBudgetExceeded = true;
+    exportState.omissions.push({ kind: "budget", message: "Token evidence exceeded maxTokenRecords." });
+    tokens = tokens.slice(0, options.maxTokenRecords);
+  }
+  exportState.tokenRecords = tokens.length;
+  const captureId = captureIdFor(identity, entries);
+  nodes.forEach((node) => {
+    if (!node.asset || !node.asset.artifactId) return;
+    node.asset = { ...node.asset, captureId };
+    snapshotState.assets.set(node.asset.artifactId, node.asset);
+  });
+  const fingerprint = hashValue({ nodes, tokens });
+  const snapshot = snapshotFor(
+    identity,
+    captureId,
+    fingerprint,
+    nodes,
+    tokens,
+    exportState.omissions.length === 0,
   );
   return {
     nodes,
-    ...(unchanged ? { unchanged: true } : {}),
-    ...(partial ? { partial: true } : {}),
-    pagination: {
-      offset: options.nodeOffset,
-      limit: options.maxNodes,
-      total: sourceEntries.length,
-      returned: nodes.length,
-      hasMore,
-      ...(hasMore ? { nextOffset: options.nodeOffset + nodes.length } : {}),
-    },
-    exportStats: {
+    tokens,
+    exportState,
+    captureId,
+    fingerprint,
+    snapshot,
+    identity,
+    options,
+    coverage: defaultCoverage(options, exportState, tokens),
+    stats: {
       totalNodes: entries.length,
       returnedNodes: nodes.length,
       assetCount: exportState.assetCount,
       assetBytes: exportState.assetBytes,
       assetsOmitted: exportState.assetsOmitted,
-      tokenCount: 0,
+      tokenCount: tokens.length,
+      textBytes: exportState.textBytes,
+      tokenRecords: exportState.tokenRecords,
+      imagePixels: exportState.imagePixels,
+      responseBytes: 0,
     },
   };
+}
+
+function shapeCompatible(left, right) {
+  return left && right && stableValue(left.identity) === stableValue(right.identity);
+}
+
+function cursorParts(cursor) {
+  if (typeof cursor !== "string" || !cursor.trim()) return null;
+  return snapshotState.cursors.get(cursor) || { unknown: true };
+}
+
+function cursorFor(current, sourceNodes, responseType, removedNodeIds, tokenState, offset) {
+  const sourceNodeIds = sourceNodes.map((node) => node.id);
+  const cursor = `cursor-${hashValue({
+    snapshotId: current.snapshot.id,
+    responseType,
+    sourceNodeIds,
+    removedNodeIds,
+    tokenState,
+    offset,
+  })}`;
+  snapshotState.cursors.set(cursor, {
+    snapshotId: current.snapshot.id,
+    responseType,
+    sourceNodeIds,
+    removedNodeIds,
+    tokenState,
+    offset,
+  });
+  while (snapshotState.cursors.size > 256) {
+    const first = snapshotState.cursors.keys().next().value;
+    if (!first) break;
+    snapshotState.cursors.delete(first);
+  }
+  return cursor;
+}
+
+function resyncResult(base, current, reason) {
+  return {
+    ...base,
+    captureId: current.captureId,
+    captureIdentity: current.snapshot.identity,
+    snapshot: current.snapshot,
+    responseType: "resync-required",
+    resyncReason: reason,
+    nodes: Array.isArray(base.nodes) ? [] : {},
+    ...(base.tokens !== undefined ? { tokens: [] } : {}),
+    tokenState: "omitted",
+    omissions: [{ kind: "unavailable", message: reason.message }],
+    coverage: current.coverage,
+    pagination: { limit: current.options.maxNodes, total: current.nodes.length, returned: 0, hasMore: false },
+    exportStats: { ...current.stats, returnedNodes: 0, responseBytes: 0 },
+  };
+}
+
+function responseForCapture(base, current, options, asRecord) {
+  const cursor = cursorParts(options.cursor);
+  if (options.cursor && !cursor) {
+    return resyncResult(base, current, { code: "CURSOR_INVALID", message: "Pagination cursor is malformed." });
+  }
+  if (options.cursor && cursor.unknown) {
+    return resyncResult(base, current, { code: "CURSOR_UNKNOWN", message: "The pagination cursor does not address a known host capture." });
+  }
+  const knownId = options.knownSnapshotId;
+  const knownBaseline = knownId ? snapshotState.snapshots.get(knownId) : undefined;
+  const cursorBaseline = cursor ? snapshotState.snapshots.get(cursor.snapshotId) : undefined;
+  const baseline = cursorBaseline || knownBaseline;
+  if (knownId && !baseline) {
+    return resyncResult(base, current, {
+      code: snapshotState.evictedSnapshotIds.has(knownId) ? "BASELINE_EVICTED" : "BASELINE_UNKNOWN",
+      message: snapshotState.evictedSnapshotIds.has(knownId)
+        ? "The requested baseline was evicted from the host capture store."
+        : "The requested baseline is not known to this plugin session.",
+    });
+  }
+  if (cursor && !cursorBaseline) {
+    return resyncResult(base, current, {
+      code: snapshotState.evictedSnapshotIds.has(cursor.snapshotId) ? "CURSOR_EVICTED" : "CURSOR_UNKNOWN",
+      message: snapshotState.evictedSnapshotIds.has(cursor.snapshotId)
+        ? "The pagination capture was evicted from the host capture store."
+        : "The pagination cursor does not address a known host capture.",
+    });
+  }
+  if (cursor && knownId && cursor.snapshotId !== knownId) {
+    return resyncResult(base, current, { code: "CURSOR_BASELINE_MISMATCH", message: "The pagination cursor and known baseline address different captures." });
+  }
+  if (baseline && (!baseline.snapshot.complete || !shapeCompatible(baseline, current.snapshot))) {
+    return resyncResult(base, current, {
+      code: baseline.snapshot.complete ? "BASELINE_INCOMPATIBLE" : "BASELINE_INCOMPLETE",
+      message: baseline.snapshot.complete
+        ? "The requested baseline was captured with an incompatible scope or evidence shape."
+        : "The requested baseline was not a complete capture.",
+    });
+  }
+  if (baseline && !current.snapshot.complete) {
+    return resyncResult(base, current, {
+      code: "CAPTURE_INCOMPLETE",
+      message: "The current capture is incomplete and cannot safely be used for an incremental response.",
+    });
+  }
+  if (cursor && cursor.snapshotId !== current.snapshot.id) {
+    return resyncResult(base, current, { code: "CURSOR_STALE", message: "Pagination cursor does not address the current stored capture." });
+  }
+
+  let responseType = "full";
+  let sourceNodes = current.nodes;
+  let removedNodeIds = [];
+  let tokenState = options.includeTokens && options.detail !== "summary" ? "replaced" : "omitted";
+  let responseTokens = tokenState === "replaced" ? current.tokens : undefined;
+  if (cursor) {
+    const currentById = new Map(current.nodes.map((node) => [node.id, node]));
+    sourceNodes = cursor.sourceNodeIds.map((id) => currentById.get(id)).filter(Boolean);
+    if (sourceNodes.length !== cursor.sourceNodeIds.length) {
+      return resyncResult(base, current, { code: "CURSOR_CAPTURE_CHANGED", message: "The stored capture no longer contains the nodes addressed by this cursor." });
+    }
+    responseType = cursor.responseType;
+    removedNodeIds = cursor.removedNodeIds;
+    tokenState = cursor.tokenState;
+    responseTokens = tokenState === "replaced" ? current.tokens : undefined;
+  } else if (knownBaseline) {
+    const same = knownBaseline.fingerprint === current.fingerprint;
+    if (options.changedOnly) {
+      if (same) {
+        responseType = "not-modified";
+        sourceNodes = [];
+        tokenState = "unchanged";
+        responseTokens = undefined;
+      } else {
+        responseType = "delta";
+        const oldNodes = new Map(knownBaseline.nodes.map((node) => [node.id, node]));
+        const newIds = new Set(current.nodes.map((node) => node.id));
+        sourceNodes = current.nodes.filter((node) => stableValue(node) !== stableValue(oldNodes.get(node.id)));
+        removedNodeIds = knownBaseline.nodes.filter((node) => !newIds.has(node.id)).map((node) => node.id);
+        tokenState = stableValue(knownBaseline.tokens) === stableValue(current.tokens) ? "unchanged" : "replaced";
+        responseTokens = tokenState === "replaced" ? current.tokens : undefined;
+      }
+    } else if (same) {
+      responseType = "not-modified";
+      sourceNodes = [];
+      tokenState = "unchanged";
+      responseTokens = undefined;
+    }
+  }
+
+  const offset = cursor ? cursor.offset : 0;
+  let selectedNodes = responseType === "not-modified"
+    ? []
+    : sourceNodes.slice(offset, offset + options.maxNodes);
+  const omissions = [...current.exportState.omissions];
+  let nextCursor;
+  const nextCursorFor = () => {
+    const nextOffset = offset + selectedNodes.length;
+    if (nextOffset >= sourceNodes.length) return undefined;
+    nextCursor = nextCursor || cursorFor(
+      current,
+      sourceNodes,
+      responseType,
+      removedNodeIds,
+      tokenState,
+      nextOffset,
+    );
+    return nextCursor;
+  };
+  const pagination = () => {
+    const next = nextCursorFor();
+    return {
+    ...(options.cursor ? { cursor: options.cursor } : {}),
+    limit: options.maxNodes,
+    total: sourceNodes.length,
+    returned: selectedNodes.length,
+    hasMore: offset + selectedNodes.length < sourceNodes.length,
+      ...(next ? { nextCursor: next } : {}),
+    };
+  };
+  const build = () => ({
+    ...base,
+    captureId: current.captureId,
+    captureIdentity: current.snapshot.identity,
+    snapshot: current.snapshot,
+    responseType,
+    ...(removedNodeIds.length ? { removedNodeIds } : {}),
+    tokenState,
+    ...(responseTokens !== undefined ? { tokens: responseTokens } : {}),
+    ...(omissions.length ? { omissions } : {}),
+    coverage: current.coverage,
+    pagination: pagination(),
+    exportStats: {
+      ...current.stats,
+      returnedNodes: selectedNodes.length,
+      responseBytes: 0,
+    },
+    nodes: asRecord
+      ? Object.fromEntries(selectedNodes.map((node) => [node.id, node]))
+      : selectedNodes,
+  });
+  let response = build();
+  while (utf8ByteLength(JSON.stringify(response)) > options.maxResponseBytes && selectedNodes.length > 0) {
+    selectedNodes = selectedNodes.slice(0, -1);
+    if (!omissions.some((item) => item.message.includes("maxResponseBytes"))) {
+      omissions.push({ kind: "budget", message: "Response exceeded maxResponseBytes; retrieve the next cursor for omitted nodes." });
+    }
+    response = build();
+  }
+  const responseBytes = utf8ByteLength(JSON.stringify(response));
+  response.exportStats.responseBytes = responseBytes;
+  if (responseBytes > options.maxResponseBytes) {
+    return resyncResult(base, current, { code: "RESPONSE_BUDGET_EXCEEDED", message: "The requested response budget is too small for its required metadata." });
+  }
+  return response;
 }
 
 async function buildDocumentIR(options) {
   const root = scenegraph.root;
   const entries = [];
   flattenSubtree(root, null, true, entries);
-  const snapshot = snapshotFor("document", undefined, options);
-  const serialized = await serializeEntries(entries, options, snapshot);
-  const tokens = serialized.unchanged ? [] : tokenCatalog(options);
+  const identity = captureIdentity("document", undefined, [nodeId(root)], selectionItems().map((item) => nodeId(item)), options);
+  const current = await materializeEntries(entries, identity, captureOptionsFor(options));
   const screens = childrenOf(root)
     .filter((child) => nodeKind(child) === "screen")
     .map((child) => ({ host: "xd", id: nodeId(child) }))
     .filter((ref) => ref.id);
   const screenDetails = screenDetailsFor(root);
   const info = documentInfo();
-  const nodes = {};
-  serialized.nodes.forEach((node) => { nodes[node.id] = node; });
-  return {
-    schemaVersion: 1,
+  return responseForCapture({
+    schemaVersion: 2,
     host: "xd",
     documentId: info.documentId,
     documentName: info.documentName,
     rootId: nodeId(root) || info.documentId,
-    nodes,
+    scope: "document",
+    nodes: {},
     screens,
     selection: selectionItems().map((item) => ({ host: "xd", id: nodeId(item) })).filter((ref) => ref.id),
-    snapshot,
-    ...(serialized.unchanged ? { unchanged: true } : {}),
-    ...(serialized.partial ? { partial: true } : {}),
-    ...(tokens.length ? { tokens } : {}),
     ...(screenDetails.length ? { screenDetails } : {}),
-    pagination: serialized.pagination,
-    exportStats: { ...serialized.exportStats, tokenCount: tokens.length },
+    ...(options.includePages ? { pages: [{ host: "xd", id: nodeId(root) || info.documentId }] } : {}),
     exportedAt: new Date().toISOString(),
-  };
+  }, current, options, true);
 }
 
 async function selectionContext(options) {
@@ -1316,25 +1829,18 @@ async function selectionContext(options) {
   const selection = selectionItems();
   const entries = [];
   selection.forEach((item) => flattenSubtree(item, item.parent ? nodeId(item.parent) : null, item.parent === scenegraph.root, entries));
-  const snapshot = snapshotFor("selection", undefined, options);
-  const serialized = await serializeEntries(entries, options, snapshot);
-  const tokens = serialized.unchanged ? [] : tokenCatalog(options);
-  return {
-    schemaVersion: 1,
+  const identity = captureIdentity("selection", undefined, selection.map((item) => nodeId(item)), selection.map((item) => nodeId(item)), options);
+  const current = await materializeEntries(entries, identity, captureOptionsFor(options));
+  return responseForCapture({
+    schemaVersion: 2,
     scope: "selection",
     host: "xd",
     documentId: info.documentId,
     documentName: info.documentName,
     selection: selection.map((item) => ({ host: "xd", id: nodeId(item) })).filter((ref) => ref.id),
-    nodes: serialized.nodes,
-    snapshot,
-    ...(serialized.unchanged ? { unchanged: true } : {}),
-    ...(serialized.partial ? { partial: true } : {}),
-    ...(tokens.length ? { tokens } : {}),
-    pagination: serialized.pagination,
-    exportStats: { ...serialized.exportStats, tokenCount: tokens.length },
+    nodes: [],
     exportedAt: new Date().toISOString(),
-  };
+  }, current, options, false);
 }
 
 function findNode(id) {
@@ -1362,31 +1868,52 @@ async function screenContext(screenId, options) {
   const info = documentInfo();
   const entries = [];
   flattenSubtree(screen, screen.parent ? nodeId(screen.parent) : null, true, entries);
-  const snapshot = snapshotFor("screen", nodeId(screen), options);
-  const serialized = await serializeEntries(entries, options, snapshot);
-  const tokens = serialized.unchanged ? [] : tokenCatalog(options);
+  const identity = captureIdentity("screen", undefined, [nodeId(screen)], selectionItems().map((item) => nodeId(item)), options);
+  const current = await materializeEntries(entries, identity, captureOptionsFor(options));
   const viewport = viewportFor(boundsOf(screen));
-  return {
-    schemaVersion: 1,
+  return responseForCapture({
+    schemaVersion: 2,
     scope: "screen",
     host: "xd",
     documentId: info.documentId,
     documentName: info.documentName,
     screenId: nodeId(screen),
     selection: selectionItems().map((item) => ({ host: "xd", id: nodeId(item) })).filter((ref) => ref.id),
-    snapshot,
-    ...(serialized.unchanged ? { unchanged: true } : {}),
-    ...(serialized.partial ? { partial: true } : {}),
     ...(viewport ? { viewport } : {}),
-    nodes: serialized.nodes,
-    ...(tokens.length ? { tokens } : {}),
-    pagination: serialized.pagination,
-    exportStats: { ...serialized.exportStats, tokenCount: tokens.length },
+    nodes: [],
     exportedAt: new Date().toISOString(),
-  };
+  }, current, options, false);
 }
 
-function visualTargets(scope, screenId) {
+async function pageContext(pageId, options) {
+  const root = pageRoot(pageId);
+  const info = documentInfo();
+  const entries = [];
+  flattenSubtree(root, null, true, entries);
+  const identity = captureIdentity("page", nodeId(root), [nodeId(root)], selectionItems().map((item) => nodeId(item)), options);
+  const current = await materializeEntries(entries, identity, captureOptionsFor(options));
+  return responseForCapture({
+    schemaVersion: 2,
+    scope: "page",
+    host: "xd",
+    documentId: info.documentId,
+    documentName: info.documentName,
+    pageId: nodeId(root),
+    selection: selectionItems().map((item) => ({ host: "xd", id: nodeId(item) })).filter((ref) => ref.id),
+    nodes: [],
+    exportedAt: new Date().toISOString(),
+  }, current, options, false);
+}
+
+function pageRoot(pageId) {
+  const root = scenegraph.root;
+  const rootId = nodeId(root);
+  if (pageId && pageId !== rootId) throw new Error("XD does not expose independent page scopes; use an artboard screen scope");
+  return root;
+}
+
+function visualTargets(scope, screenId, pageId) {
+  if (scope === "page") return [pageRoot(pageId)];
   if (scope === "screen") {
     const screen = findScreen(screenId);
     if (!screen) throw new Error("No XD artboard was found for the requested visual context");
@@ -1394,45 +1921,132 @@ function visualTargets(scope, screenId) {
   }
   const selected = selectionItems();
   if (!selected.length) throw new Error("XD selection is empty");
-  return selected.slice(0, 4);
+  return selected;
 }
 
-async function visualContext(scope, screenId) {
-  const targets = visualTargets(scope, screenId);
+function pngDimensions(value) {
+  const bytes = bytesFromArrayBuffer(value);
+  if (bytes.length < 24 || bytes[0] !== 137 || bytes[1] !== 80 || bytes[2] !== 78 || bytes[3] !== 71) return undefined;
+  return {
+    width: (bytes[16] * 0x1000000) + (bytes[17] << 16) + (bytes[18] << 8) + bytes[19],
+    height: (bytes[20] * 0x1000000) + (bytes[21] << 16) + (bytes[22] << 8) + bytes[23],
+  };
+}
+
+async function visualContext(scope, screenId, options = {}) {
+  syncDocumentRevision();
+  syncSelectionRevision();
+  const normalizedOptions = {
+    maxImagePixels: Number.isInteger(options.maxImagePixels) && options.maxImagePixels > 0
+      ? Math.min(100000000, options.maxImagePixels)
+      : DEFAULT_EXPORT_OPTIONS.maxImagePixels,
+    maxImageBytes: Number.isInteger(options.maxImageBytes) && options.maxImageBytes > 0
+      ? Math.min(50000000, options.maxImageBytes)
+      : 12000000,
+  };
+  const targets = visualTargets(scope, screenId, options.pageId);
+  const entries = [];
+  targets.forEach((target) => flattenSubtree(target, target.parent ? nodeId(target.parent) : null, true, entries));
+  const identity = captureIdentity(
+    scope,
+    scope === "page" ? nodeId(targets[0]) : undefined,
+    targets.map((target) => nodeId(target)),
+    selectionItems().map((item) => nodeId(item)),
+    { ...DEFAULT_EXPORT_OPTIONS, detail: "full", includeAssets: false, includeTokens: false },
+  );
+  const captureId = captureIdFor(identity, entries);
   const items = [];
+  let imagePixels = 0;
+  let imageBytes = 0;
   for (let index = 0; index < targets.length; index += 1) {
     const target = targets[index];
     const bounds = boundsOf(target);
     const maxDimension = Math.max(bounds ? bounds.width : 0, bounds ? bounds.height : 0);
-    const scale = maxDimension > 1024 ? Math.max(0.1, 1024 / maxDimension) : 1;
-    const folder = await localFileSystem.getTemporaryFolder();
-    const file = await folder.createFile(`designport-${Date.now()}-${index}.png`);
-    await application.createRenditions([{
-      node: target,
-      outputFile: file,
-      type: application.RenditionType.PNG,
-      scale,
-    }]);
-    const bytes = await file.read({ format: formats.binary });
-    items.push({
-      nodeId: nodeId(target),
-      nodeName: typeof target.name === "string" ? target.name : nodeType(target),
-      mimeType: "image/png",
-      data: base64FromArrayBuffer(bytes),
-      bounds,
-      scale,
-    });
+    const area = Math.max(1, (bounds ? bounds.width : 1) * (bounds ? bounds.height : 1));
+    const scale = Math.min(1, maxDimension > 1024 ? 1024 / maxDimension : 1, Math.sqrt(normalizedOptions.maxImagePixels / area));
+    let file;
+    try {
+      const folder = await localFileSystem.getTemporaryFolder();
+      file = await folder.createFile(`designport-${Date.now()}-${index}.png`);
+      await application.createRenditions([{
+        node: target,
+        outputFile: file,
+        type: application.RenditionType.PNG,
+        scale,
+      }]);
+      const bytes = await file.read({ format: formats.binary });
+      const encoded = base64FromArrayBuffer(bytes);
+      const encodedBytes = utf8ByteLength(encoded);
+      if (imageBytes + encodedBytes > normalizedOptions.maxImageBytes) {
+        const error = new Error("Rendered PNG exceeds maxImageBytes");
+        error.code = "VISUAL_BUDGET_EXCEEDED";
+        throw error;
+      }
+      imageBytes += encodedBytes;
+      const dimensions = pngDimensions(bytes) || {
+        width: Math.max(1, Math.ceil((bounds ? bounds.width : 1) * scale)),
+        height: Math.max(1, Math.ceil((bounds ? bounds.height : 1) * scale)),
+      };
+      imagePixels += dimensions.width * dimensions.height;
+      if (imagePixels > normalizedOptions.maxImagePixels) {
+        const error = new Error("Rendered PNG pixels exceed maxImagePixels");
+        error.code = "VISUAL_BUDGET_EXCEEDED";
+        throw error;
+      }
+      items.push({
+        nodeId: nodeId(target),
+        nodeName: typeof target.name === "string" ? target.name : nodeType(target),
+        mimeType: "image/png",
+        data: encoded,
+        bounds,
+        scale,
+        pixelWidth: dimensions.width,
+        pixelHeight: dimensions.height,
+        cropOrigin: bounds ? { x: bounds.x, y: bounds.y } : undefined,
+        worldToPixel: bounds ? { a: scale, b: 0, c: 0, d: scale, tx: -bounds.x * scale, ty: -bounds.y * scale } : undefined,
+        captureId,
+      });
+    } finally {
+      await removeTemporaryFile(file);
+    }
   }
   const info = documentInfo();
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     scope,
     host: "xd",
     documentId: info.documentId,
     documentName: info.documentName,
+    captureId,
+    captureIdentity: identity,
     items,
     exportedAt: new Date().toISOString(),
   };
+}
+
+async function getAsset(payload) {
+  const artifactId = payload && payload.artifactId;
+  const captureId = payload && payload.captureId;
+  const maxBytes = Number.isInteger(payload && payload.maxBytes) && payload.maxBytes > 0
+    ? Math.min(50000000, payload.maxBytes)
+    : 4000000;
+  const asset = snapshotState.assets.get(artifactId);
+  if (!asset) {
+    const error = new Error("Requested asset is unavailable or expired");
+    error.code = "ASSET_UNAVAILABLE";
+    throw error;
+  }
+  if (asset.captureId !== captureId) {
+    const error = new Error("Requested asset belongs to a different capture");
+    error.code = "ASSET_CAPTURE_MISMATCH";
+    throw error;
+  }
+  if (asset.size > maxBytes) {
+    const error = new Error("Requested asset exceeds maxBytes");
+    error.code = "ASSET_BUDGET_EXCEEDED";
+    throw error;
+  }
+  return asset;
 }
 
 function colorToHex(color) {
@@ -1442,6 +2056,19 @@ function colorToHex(color) {
 }
 
 function applyPatch(node, patch) {
+  const unsupported = Object.keys(patch || {}).filter((key) => ![
+    "coordinateSpace", "name", "bounds", "visible", "opacity", "fills", "text",
+  ].includes(key));
+  if (unsupported.length) {
+    const error = new Error(`XD does not support these patch fields: ${unsupported.join(", ")}`);
+    error.code = "UNSUPPORTED_PATCH_FIELD";
+    throw error;
+  }
+  if (Array.isArray(patch.fills) && patch.fills.some((fill) => fill.type !== "solid" || !fill.color)) {
+    const error = new Error("XD writes currently support solid fills only");
+    error.code = "UNSUPPORTED_PATCH_FIELD";
+    throw error;
+  }
   if (patch.name) node.name = patch.name;
   if (typeof patch.visible === "boolean") node.visible = patch.visible;
   if (Number.isFinite(patch.opacity)) node.opacity = clamp(patch.opacity, 0, 1);
@@ -1456,9 +2083,68 @@ function applyPatch(node, patch) {
       Number.isFinite(patch.bounds.height) ? patch.bounds.height : current.height,
     );
   }
+  if (patch.bounds && (Number.isFinite(patch.bounds.x) || Number.isFinite(patch.bounds.y))) {
+    const current = node.localBounds || { x: 0, y: 0 };
+    const x = Number.isFinite(patch.bounds.x) ? patch.bounds.x : current.x;
+    const y = Number.isFinite(patch.bounds.y) ? patch.bounds.y : current.y;
+    if (patch.coordinateSpace === "world" && node.globalBounds && node.parent && node.parent.globalBounds) {
+      const parentBounds = node.parent.globalBounds;
+      node.moveInParentCoordinates(x - (Number(parentBounds.x) || 0), y - (Number(parentBounds.y) || 0));
+    } else if (typeof node.moveInParentCoordinates === "function") {
+      node.moveInParentCoordinates(x, y);
+    }
+  }
+}
+
+function validateWriteState(payload, selection, operation) {
+  syncDocumentRevision();
+  syncSelectionRevision();
+  const expected = payload && payload.expectedSnapshotId;
+  const baseline = expected && snapshotState.snapshots.get(expected);
+  if (!baseline) {
+    const error = new Error("Write requires a known complete capture snapshot");
+    error.code = snapshotState.evictedSnapshotIds.has(expected) ? "WRITE_BASELINE_EVICTED" : "WRITE_BASELINE_UNKNOWN";
+    throw error;
+  }
+  const info = documentInfo();
+  if (payload.documentId && payload.documentId !== info.documentId) {
+    const error = new Error("Write documentId does not match the connected document");
+    error.code = "WRITE_DOCUMENT_MISMATCH";
+    throw error;
+  }
+  if (payload.sessionId && payload.sessionId !== baseline.snapshot.identity.sessionId) {
+    const error = new Error("Write sessionId does not match the expected capture");
+    error.code = "WRITE_SESSION_MISMATCH";
+    throw error;
+  }
+  if (!baseline.snapshot.complete
+    || baseline.snapshot.identity.documentId !== info.documentId
+    || baseline.snapshot.documentRevision !== snapshotState.documentRevision
+    || baseline.snapshot.selectionRevision !== snapshotState.selectionRevision) {
+    const error = new Error("The expected capture is stale; read a fresh capture before writing");
+    error.code = "WRITE_STALE_CAPTURE";
+    throw error;
+  }
+  if (operation === "update_selection") {
+    const targetIds = Array.isArray(payload.targetIds) ? payload.targetIds : [];
+    if (!targetIds.every((id) => baseline.snapshot.identity.selectedIds.includes(id))) {
+      const error = new Error("Write targets are not members of the expected selection capture");
+      error.code = "WRITE_TARGET_MISMATCH";
+      throw error;
+    }
+    const currentIds = (selection.items || []).map((item) => nodeId(item)).filter(Boolean);
+    if (currentIds.length !== baseline.snapshot.identity.selectedIds.length
+      || currentIds.some((id) => !baseline.snapshot.identity.selectedIds.includes(id))) {
+      const error = new Error("The XD selection changed after the write was queued");
+      error.code = "WRITE_SELECTION_CHANGED";
+      throw error;
+    }
+  }
+  return baseline;
 }
 
 function executeWrite(operation, payload, selection, documentRoot) {
+  validateWriteState(payload || {}, selection, operation);
   if (operation === "create_screen") {
     const spec = payload || {};
     const artboard = new Artboard();
@@ -1480,8 +2166,14 @@ function executeWrite(operation, payload, selection, documentRoot) {
   }
 
   if (operation === "update_selection") {
-    const items = selection.items || [];
-    if (!items.length) {
+    const targetIds = Array.isArray(payload && payload.targetIds) ? payload.targetIds : [];
+    const items = targetIds.map((id) => findNode(id));
+    if (!items.length || items.some((item) => !item)) {
+      const error = new Error("One or more XD write target IDs are unavailable");
+      error.code = "WRITE_TARGET_UNAVAILABLE";
+      throw error;
+    }
+    if (!selection.items || !selection.items.length) {
       const error = new Error("XD selection is empty");
       error.code = "EMPTY_SELECTION";
       throw error;
@@ -1505,20 +2197,54 @@ function sendResponse(requestId, ok, value) {
   send({ type: "response", requestId, ok, ...(ok ? { result: value } : { error: value }) });
 }
 
+function eventPayload(payload = {}) {
+  syncDocumentRevision();
+  syncSelectionRevision();
+  const info = documentInfo();
+  const ids = (value) => Array.from(new Set((Array.isArray(value) ? value : []).filter(Boolean))).slice(0, 200);
+  return {
+    sequence: ++snapshotState.eventSequence,
+    documentId: info.documentId,
+    documentRevision: snapshotState.documentRevision,
+    selectionRevision: snapshotState.selectionRevision,
+    affectedNodeIds: ids(payload.affectedNodeIds),
+    removedNodeIds: ids(payload.removedNodeIds),
+    ...(payload.status ? { status: String(payload.status).slice(0, 160) } : {}),
+    ...(payload.operation ? { operation: String(payload.operation).slice(0, 80) } : {}),
+    ...(payload.pendingId ? { pendingId: String(payload.pendingId).slice(0, 160) } : {}),
+    ...(payload.requestId ? { requestId: String(payload.requestId).slice(0, 160) } : {}),
+    ...(payload.errorCode ? { errorCode: String(payload.errorCode).slice(0, 80) } : {}),
+  };
+}
+
 function sendEvent(event, payload) {
-  send({ type: "event", event, payload });
+  send({ type: "event", event, payload: eventPayload(payload) });
 }
 
 function errorPayload(error) {
   return {
     code: error && error.code ? error.code : "XD_PLUGIN_ERROR",
     message: error && error.message ? error.message : String(error),
+    ...(error && error.details !== undefined ? { details: error.details } : {}),
   };
 }
 
 function queueWrite(request) {
-  const pendingId = `xd-pending-${Date.now()}-${state.pendingWrites.length + 1}`;
-  state.pendingWrites.push({ pendingId, request });
+  if (state.pendingWrites.length >= MAX_PENDING_WRITES) {
+    const error = new Error("XD write queue is full");
+    error.code = "XD_WRITE_QUEUE_FULL";
+    throw error;
+  }
+  const pendingId = `xd-pending-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const expiresAt = Date.now() + WRITE_TTL_MS;
+  state.pendingWrites.push({ pendingId, request, expiresAt });
+  state.writeStatuses.set(pendingId, {
+    pendingId,
+    status: "queued",
+    operation: request.operation,
+    message: "Waiting for the user to apply the XD write.",
+    expiresAt,
+  });
   renderPanel();
   sendResponse(request.requestId, true, {
     status: "queued",
@@ -1527,7 +2253,7 @@ function queueWrite(request) {
     pendingCount: state.pendingWrites.length,
     message: "Open the DesignPort panel and press Apply to edit the XD document.",
   });
-  sendEvent("write.queued", { pendingId, requestId: request.requestId, operation: request.operation });
+  sendEvent("write.queued", { pendingId, requestId: request.requestId, operation: request.operation, status: "queued" });
 }
 
 async function handleRequest(request) {
@@ -1549,6 +2275,7 @@ async function handleRequest(request) {
         sendResponse(request.requestId, true, await visualContext(
           (request.payload && request.payload.scope) || "screen",
           request.payload && request.payload.screenId,
+          request.payload || {},
         ));
         return;
       case "export_ir": {
@@ -1558,15 +2285,43 @@ async function handleRequest(request) {
           ? await selectionContext(options)
           : scope === "screen"
             ? await screenContext(request.payload && request.payload.screenId, options)
-            : await buildDocumentIR(options);
+            : scope === "page"
+              ? await pageContext(request.payload && request.payload.pageId, options)
+              : await buildDocumentIR(options);
         sendResponse(request.requestId, true, result);
         return;
       }
+      case "get_asset":
+        sendResponse(request.requestId, true, await getAsset(request.payload || {}));
+        return;
+      case "get_operation_status": {
+        const pendingId = request.payload && request.payload.pendingId;
+        const status = state.writeStatuses.get(pendingId);
+        sendResponse(request.requestId, true, status
+          ? {
+            pendingId: status.pendingId,
+            status: status.status,
+            operation: status.operation,
+            ...(status.message ? { message: status.message } : {}),
+            ...(status.error ? { error: status.error } : {}),
+          }
+          : {
+            pendingId,
+            status: "failed",
+            operation: "unknown",
+            message: "The requested XD operation status is unavailable.",
+          });
+        return;
+      }
       case "create_screen":
-      case "create_component":
       case "update_selection":
         queueWrite(request);
         return;
+      case "create_component": {
+        const error = new Error("XD cannot create a new component definition through the plugin API");
+        error.code = "XD_COMPONENT_CREATION_UNSUPPORTED";
+        throw error;
+      }
       default: {
         const error = new Error(`Unknown DesignPort operation: ${request.operation}`);
         error.code = "UNKNOWN_OPERATION";
@@ -1592,9 +2347,10 @@ function connect() {
       const info = documentInfo();
       send({
         type: "hello",
-        protocolVersion: 1,
+        protocolVersion: BRIDGE_PROTOCOL_VERSION,
         host: "xd",
         pluginVersion: PLUGIN_VERSION,
+        pairingToken: PAIRING_TOKEN,
         documentId: info.documentId,
         documentName: info.documentName,
         capabilities: CAPABILITIES,
@@ -1646,32 +2402,67 @@ function applyNextPending() {
     renderPanel();
     return;
   }
+  if (item.expiresAt <= Date.now()) {
+    state.writeStatuses.set(item.pendingId, {
+      pendingId: item.pendingId,
+      status: "expired",
+      operation: item.request.operation,
+      message: "The queued XD write expired before it was applied.",
+    });
+    renderPanel();
+    sendEvent("write.failed", {
+      pendingId: item.pendingId,
+      requestId: item.request.requestId,
+      operation: item.request.operation,
+      status: "expired",
+      errorCode: "WRITE_EXPIRED",
+    });
+    return;
+  }
   try {
     let result;
     application.editDocument((selection, documentRoot) => {
       result = executeWrite(item.request.operation, item.request.payload, selection, documentRoot);
     });
     snapshotState.documentRevision += 1;
+    snapshotState.documentSignature = documentSignature();
+    state.writeStatuses.set(item.pendingId, {
+      pendingId: item.pendingId,
+      status: "applied",
+      operation: item.request.operation,
+      message: "The XD write was applied.",
+    });
     rememberChangedNodeIds([
       result && result.node && result.node.id,
       ...(result && Array.isArray(result.nodes) ? result.nodes.map((node) => node && node.id) : []),
     ]);
-    assetCache.clear();
-    assetPromises.clear();
+    clearAssetCache();
     renderPanel();
     sendEvent("write.applied", {
       pendingId: item.pendingId,
       requestId: item.request.requestId,
       operation: item.request.operation,
-      result,
+      status: "applied",
+      affectedNodeIds: [
+        result && result.node && result.node.id,
+        ...(result && Array.isArray(result.nodes) ? result.nodes.map((node) => node && node.id) : []),
+      ],
     });
   } catch (error) {
+    state.writeStatuses.set(item.pendingId, {
+      pendingId: item.pendingId,
+      status: "failed",
+      operation: item.request.operation,
+      message: error && error.message ? error.message : String(error),
+      error: errorPayload(error),
+    });
     renderPanel();
     sendEvent("write.failed", {
       pendingId: item.pendingId,
       requestId: item.request.requestId,
       operation: item.request.operation,
-      error: errorPayload(error),
+      status: "failed",
+      errorCode: error && error.code ? error.code : "XD_PLUGIN_ERROR",
     });
     setStatus(`Write failed: ${error.message}`);
   }
@@ -1742,12 +2533,10 @@ entrypoints.setup({
         setupPanel(rootNode);
       },
       update() {
-        void selectionContext({
-          ...DEFAULT_EXPORT_OPTIONS,
-          maxNodes: 500,
-          includeAssets: false,
-          includeTokens: false,
-        }).then((payload) => sendEvent("selection.changed", payload));
+        sendEvent("selection.changed", {
+          affectedNodeIds: selectionItems().map((item) => nodeId(item)),
+          status: "selection-changed",
+        });
       },
     },
   },

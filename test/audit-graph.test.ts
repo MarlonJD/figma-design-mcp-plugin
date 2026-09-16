@@ -4,9 +4,55 @@ import { auditDesignContext } from "../src/core/audit.js";
 import { buildDesignGraph } from "../src/core/graph.js";
 import { contextIRSchema } from "../src/core/ir.js";
 
-function context() {
-  return contextIRSchema.parse({
-    schemaVersion: 1,
+const exportedAt = new Date().toISOString();
+
+function coverage(layout: Record<string, unknown> = { status: "complete" }) {
+  return {
+    geometry: { status: "complete" as const },
+    layout,
+    typography: { status: "complete" as const },
+    tokens: { status: "complete" as const },
+    components: { status: "complete" as const },
+    interactions: { status: "complete" as const },
+    assets: { status: "complete" as const },
+    accessibility: { status: "complete" as const },
+  };
+}
+
+function identity() {
+  return {
+    sessionId: "session-audit",
+    documentId: "doc-audit",
+    scope: "screen" as const,
+    pageId: "page-1",
+    scopeRootIds: ["screen-1"],
+    selectedIds: [],
+    normalizationVersion: "designport-ir-v2" as const,
+    evidenceShape: {
+      detail: "structure" as const,
+      includeAssets: false,
+      includeTokens: true,
+      maxAssetBytes: 0,
+      maxTextBytes: 200000,
+      maxTokenRecords: 5000,
+    },
+  };
+}
+
+function accessible(role: "button" | "heading") {
+  return {
+    role,
+    source: "inferred" as const,
+    confidence: 0.4,
+    provenance: {
+      role: { source: "inferred" as const, sourceField: "node.name", inferenceRuleVersion: "accessibility-name-v2" },
+    },
+  };
+}
+
+function context(options: { paginated?: boolean; partialLayout?: boolean } = {}) {
+  const parsed = contextIRSchema.parse({
+    schemaVersion: 2,
     scope: "screen",
     host: "figma",
     documentId: "doc-audit",
@@ -32,7 +78,7 @@ function context() {
         children: [],
         bounds: { x: 24, y: 24, width: 160, height: 48 },
         visible: true,
-        accessibility: { role: "button" },
+        accessibility: accessible("button"),
         prototypeLinks: [{ trigger: "on_click", action: "node" }],
         styleRefs: { fill: "missing-token" },
       },
@@ -92,7 +138,7 @@ function context() {
         children: [],
         bounds: { x: 24, y: 240, width: 400, height: 48 },
         visible: true,
-        accessibility: { role: "heading" },
+        accessibility: accessible("heading"),
       },
       {
         id: "instance-1",
@@ -106,24 +152,34 @@ function context() {
       },
     ],
     tokens: [],
-    pagination: { offset: 0, limit: 100, total: 9, returned: 9, hasMore: true },
+    pagination: { limit: 100, total: 9, returned: 9, hasMore: options.paginated === true },
     snapshot: {
       id: "snapshot-audit",
+      captureId: "capture-audit",
+      identity: identity(),
       scope: "screen",
       documentRevision: 1,
       selectionRevision: 1,
-      screenId: "screen-1",
-      generatedAt: new Date().toISOString(),
+      generation: 1,
+      complete: true,
+      generatedAt: exportedAt,
     },
-    exportedAt: new Date().toISOString(),
+    captureId: "capture-audit",
+    captureIdentity: identity(),
+    responseType: "full",
+    coverage: coverage(options.partialLayout ? { status: "partial", reason: "Parent coverage omitted" } : undefined),
+    exportedAt,
   });
+  return parsed;
 }
 
-test("semantic audit reports actionable layout and accessibility diagnostics", () => {
+test("semantic audit reports actionable findings with stable evidence identity", () => {
   const audit = auditDesignContext(context());
   const codes = new Set(audit.diagnostics.map((diagnostic) => diagnostic.code));
-  assert.equal(audit.partial, true);
+  assert.equal(audit.partial, false);
+  assert.equal(audit.status, "complete");
   assert.equal(audit.snapshotId, "snapshot-audit");
+  assert.equal(audit.captureId, "capture-audit");
   assert.equal(codes.has("absolute-child-in-flow"), true);
   assert.equal(codes.has("interactive-missing-label"), true);
   assert.equal(codes.has("interaction-without-destination"), true);
@@ -133,13 +189,22 @@ test("semantic audit reports actionable layout and accessibility diagnostics", (
   assert.equal(codes.has("missing-flow-metadata"), true);
   assert.equal(codes.has("instance-missing-component-reference"), true);
   assert.equal(codes.has("unresolved-token-reference"), true);
+  assert.ok(audit.diagnostics.every((diagnostic) => diagnostic.id.startsWith("diag-")));
   assert.equal(audit.summary.nodeCount, 9);
 });
 
-test("design graph preserves reusable component and prototype relationships", () => {
+test("partial parent evidence suppresses parent-dependent layout findings", () => {
+  const audit = auditDesignContext(context({ paginated: true, partialLayout: true }));
+  const codes = new Set(audit.diagnostics.map((diagnostic) => diagnostic.code));
+  assert.equal(audit.partial, true);
+  assert.equal(audit.status, "partial");
+  assert.equal(codes.has("grow-without-flow"), false);
+});
+
+test("design graph preserves reusable components, overlays, and viewport provenance", () => {
   const graph = buildDesignGraph(context());
   assert.equal(graph.scope, "screen");
-  assert.equal(graph.partial, true);
+  assert.equal(graph.partial, false);
   assert.deepEqual(graph.screens, [{
     id: "screen-1",
     name: "Dashboard",
@@ -148,6 +213,7 @@ test("design graph preserves reusable component and prototype relationships", ()
       height: 800,
       orientation: "landscape",
       breakpoint: "expanded",
+      breakpointSource: "heuristic",
     },
   }]);
   assert.deepEqual(graph.components, [{
@@ -160,5 +226,6 @@ test("design graph preserves reusable component and prototype relationships", ()
     sourceNodeId: "button-1",
     trigger: "on_click",
     action: "node",
+    resolutionStatus: "unknown",
   }]);
 });

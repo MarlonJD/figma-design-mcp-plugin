@@ -389,6 +389,25 @@ children use `parentRef`. Auto-layout parents must be created before their
 children logically, although the host orders valid references before
 mutation. `fill` sizing is only valid for auto-layout children, and `hug` is
 only valid for text or auto-layout frame/component nodes.
+For native instances, sizing is inherited from the referenced component; use
+fixed or fill sizing when the instance is a child of an auto-layout parent.
+
+An existing local Figma component can be instantiated without importing or
+cloning a remote document. The component ID must belong to the same document;
+only exposed text property keys may be overridden. The response includes the
+instance reference and its newly created descendant IDs:
+
+```json
+{
+  "ref": "primary-action",
+  "kind": "instance",
+  "name": "Open planning",
+  "componentId": "LOCAL_COMPONENT_ID",
+  "width": 220,
+  "height": 52,
+  "textOverrides": { "Label#0:0": "Open planning" }
+}
+```
 
 To apply a narrow change to explicit IDs from the captured scope:
 
@@ -424,6 +443,51 @@ supported writes immediately; XD queues supported writes for the user-initiated
 Apply action in its panel and explicitly rejects node-tree, typography, and
 Auto Layout authoring.
 
+To connect screens, use `design.set_prototype` with the native capture session
+from `snapshot.identity.sessionId`, not the bridge connection ID. Sources must
+be in the complete expected capture. Destinations and flow starts may be
+outside a source-screen capture, but they must be top-level frames on the same
+Figma page and document. A set destination must also be different from the
+source's containing top-level frame; same-screen navigation self-links are
+rejected before mutation:
+
+```json
+{
+  "tool": "design.set_prototype",
+  "arguments": {
+    "host": "figma",
+    "sessionId": "BRIDGE_SESSION_ID_FROM_design.list_hosts",
+    "captureSessionId": "SNAPSHOT.identity.sessionId",
+    "documentId": "DOCUMENT_ID_FROM_CAPTURE",
+    "expectedSnapshotId": "SOURCE_SCREEN_SNAPSHOT_ID",
+    "links": [
+      {
+        "sourceNodeId": "SOURCE_CONTROL_ID",
+        "destinationNodeId": "DESTINATION_FRAME_ID",
+        "mode": "set",
+        "trigger": "on_click",
+        "transition": "instant"
+      },
+      {
+        "sourceNodeId": "SOURCE_CONTROL_ID",
+        "destinationNodeId": "OLD_DESTINATION_FRAME_ID",
+        "mode": "clear",
+        "clearScope": "matching"
+      }
+    ],
+    "flowStartingPoints": [
+      { "nodeId": "DESTINATION_FRAME_ID", "name": "Planning", "mode": "set" }
+    ]
+  }
+}
+```
+
+The complete batch is validated before any reaction or flow mutation. The
+result reports `affectedNodeIds`, `linksSet`, `linksCleared`, `flowsSet`, and
+`flowsCleared`. `clearScope: "matching"` preserves unrelated interactions;
+`clearScope: "all"` is the explicit opt-in to remove every source reaction.
+Native values are restored if a setter fails.
+
 ## Reproduce the Avia wireframe fixture
 
 The checked-in fixture creates three 1440×900 desktop screens for the fictional
@@ -442,8 +506,8 @@ npm run fixture:avia -- --host-timeout-ms 120000
 
 Point the development plugin at the bridge URL printed by the runner before
 the timeout expires. The runner prints a machine-readable JSON result after
-the MCP calls complete. Reusable instances/variants and prototype links are
-documented as deferred for this static wireframe experiment.
+the MCP calls complete. This static runner does not wire prototype links; use
+the bounded operation above from the coordinator-owned full-screen generator.
 
 ## A practical agent prompt
 

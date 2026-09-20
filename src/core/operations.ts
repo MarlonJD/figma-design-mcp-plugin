@@ -10,6 +10,7 @@ import {
   hostCapabilitiesSchema,
   hostKindSchema,
   nodeTreeSpecSchema,
+  setPrototypeSpecSchema,
   screenSpecSchema,
   visualContextSchema,
 } from "./ir.js";
@@ -54,6 +55,7 @@ const updateSelectionInputSchema = z.object({
   targetIds: z.array(z.string().min(1)).min(1).max(2000),
   ...writeStateSchema.shape,
 }).strict();
+const setPrototypeInputSchema = setPrototypeSpecSchema.extend(writeStateSchema.shape).strict();
 
 const assetInputSchema = z.object({
   artifactId: z.string().min(1),
@@ -91,6 +93,15 @@ const nodeTreeOutputSchema = writeOutputSchema.extend({
   createdNodeIds: z.array(z.string().min(1)).min(1),
   rootNodeIds: z.array(z.string().min(1)).min(1),
   referenceMap: z.record(z.string(), z.string()).refine((value) => Object.keys(value).length > 0),
+}).strict();
+
+const prototypeOutputSchema = writeOutputSchema.extend({
+  status: z.literal("applied"),
+  affectedNodeIds: z.array(z.string().min(1)).min(1),
+  linksSet: z.number().int().nonnegative(),
+  linksCleared: z.number().int().nonnegative(),
+  flowsSet: z.number().int().nonnegative(),
+  flowsCleared: z.number().int().nonnegative(),
 }).strict();
 
 const assetOutputSchema = designAssetSchema.extend({
@@ -186,6 +197,12 @@ export const operationRegistry = {
     capability: "update_selection",
     input: updateSelectionInputSchema,
     output: writeOutputSchema,
+  },
+  set_prototype: {
+    access: "write",
+    capability: "set_prototype",
+    input: setPrototypeInputSchema,
+    output: prototypeOutputSchema,
   },
 } satisfies Record<string, OperationDefinition>;
 

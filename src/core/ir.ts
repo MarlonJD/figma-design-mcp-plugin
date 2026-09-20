@@ -583,6 +583,7 @@ export const hostCapabilitiesSchema = z.object({
     createComponent: z.boolean(),
     createNodeTree: z.boolean(),
     updateSelection: z.boolean(),
+    setPrototype: z.boolean(),
     userActionRequiredForWrite: z.boolean(),
     visualRead: z.boolean().optional(),
   }),
@@ -664,6 +665,7 @@ export const authoringNodeKindSchema = z.enum([
   "text",
   "rectangle",
   "component",
+  "instance",
 ]);
 export type AuthoringNodeKind = z.infer<typeof authoringNodeKindSchema>;
 
@@ -739,6 +741,8 @@ export const authoringNodeSchema = z.object({
   y: z.number().finite().optional(),
   width: z.number().finite().positive().max(100000).optional(),
   height: z.number().finite().positive().max(100000).optional(),
+  componentId: z.string().min(1).max(200).optional(),
+  textOverrides: z.record(z.string().min(1).max(120), z.string().max(2000)).optional(),
   fill: authoringColorSchema.optional(),
   stroke: authoringStrokeSchema.optional(),
   cornerRadius: z.number().finite().nonnegative().max(10000).optional(),
@@ -756,6 +760,24 @@ export const authoringNodeSchema = z.object({
   }
   if (node.kind !== "text" && (node.text !== undefined || node.typography !== undefined)) {
     context.addIssue({ code: "custom", path: ["text"], message: "Only text nodes may set text or typography." });
+  }
+  if (node.kind === "instance" && node.componentId === undefined) {
+    context.addIssue({ code: "custom", path: ["componentId"], message: "Instance nodes require an existing local componentId." });
+  }
+  if (node.kind !== "instance" && (node.componentId !== undefined || node.textOverrides !== undefined)) {
+    context.addIssue({ code: "custom", path: ["componentId"], message: "componentId and textOverrides are only valid for instance nodes." });
+  }
+  if (node.kind === "instance") {
+    if (node.fill !== undefined || node.stroke !== undefined || node.cornerRadius !== undefined
+      || node.cornerRadii !== undefined || node.clipsContent !== undefined) {
+      context.addIssue({ code: "custom", path: ["kind"], message: "Instance nodes only support native sizing, positioning, visibility, and exposed text overrides." });
+    }
+    if (node.textOverrides && Object.keys(node.textOverrides).length > 8) {
+      context.addIssue({ code: "custom", path: ["textOverrides"], message: "An instance may override at most 8 exposed text properties." });
+    }
+    if (node.textOverrides && JSON.stringify(node.textOverrides).length > 20000) {
+      context.addIssue({ code: "custom", path: ["textOverrides"], message: "Instance text overrides exceed the 20 KB limit." });
+    }
   }
   if (node.kind !== "frame" && node.kind !== "component" && node.layout?.mode !== undefined && node.layout.mode !== "none") {
     context.addIssue({ code: "custom", path: ["layout", "mode"], message: "Only frame and component nodes may own auto layout." });
@@ -837,9 +859,9 @@ export const nodeTreeSpecSchema = z.object({
       }
     }
     if ((layout?.sizingHorizontal === "hug" || layout?.sizingVertical === "hug")
-      && node.kind !== "text"
+      && node.kind !== "text" && node.kind !== "instance"
       && layout?.mode === "none") {
-      context.addIssue({ code: "custom", path: ["nodes", index, "layout"], message: "Hug sizing requires a text node or an auto-layout frame/component." });
+      context.addIssue({ code: "custom", path: ["nodes", index, "layout"], message: "Hug sizing requires a text node or a native auto-layout frame/component/instance." });
     }
     if (parentLayout && parentLayout !== "none" && node.positioning === "auto" && (node.x !== undefined || node.y !== undefined)) {
       context.addIssue({ code: "custom", path: ["nodes", index], message: "Flow children cannot set x/y; use absolute positioning for overlays." });
@@ -854,6 +876,65 @@ export const nodeTreeSpecSchema = z.object({
   });
 });
 export type NodeTreeSpec = z.infer<typeof nodeTreeSpecSchema>;
+
+export const prototypeLinkWriteSchema = z.object({
+  sourceNodeId: z.string().min(1),
+  destinationNodeId: z.string().min(1).optional(),
+  mode: z.enum(["set", "clear"]),
+  trigger: z.literal("on_click").default("on_click"),
+  transition: z.literal("instant").default("instant"),
+  clearScope: z.enum(["matching", "all"]).optional(),
+}).strict().superRefine((link, context) => {
+  if (link.mode === "set") {
+    if (!link.destinationNodeId) {
+      context.addIssue({ code: "custom", path: ["destinationNodeId"], message: "Setting a prototype link requires destinationNodeId." });
+    }
+    if (link.clearScope !== undefined) {
+      context.addIssue({ code: "custom", path: ["clearScope"], message: "clearScope is only valid when clearing a prototype link." });
+    }
+  } else if (link.clearScope === "matching" && !link.destinationNodeId) {
+    context.addIssue({ code: "custom", path: ["destinationNodeId"], message: "Matching clear requires destinationNodeId." });
+  } else if (link.clearScope === "all" && link.destinationNodeId) {
+    context.addIssue({ code: "custom", path: ["destinationNodeId"], message: "All-link clear cannot include destinationNodeId." });
+  } else if (link.clearScope === undefined) {
+    context.addIssue({ code: "custom", path: ["clearScope"], message: "Clearing requires clearScope=matching or clearScope=all." });
+  }
+});
+export type PrototypeLinkWrite = z.infer<typeof prototypeLinkWriteSchema>;
+
+export const prototypeFlowStartingPointSchema = z.object({
+  nodeId: z.string().min(1),
+  name: z.string().min(1).max(120).optional(),
+  mode: z.enum(["set", "clear"]).default("set"),
+}).strict().superRefine((flow, context) => {
+  if (flow.mode === "set" && !flow.name) {
+    context.addIssue({ code: "custom", path: ["name"], message: "Setting a flow starting point requires a name." });
+  }
+  if (flow.mode === "clear" && flow.name !== undefined) {
+    context.addIssue({ code: "custom", path: ["name"], message: "Clearing a flow starting point cannot include a name." });
+  }
+});
+export type PrototypeFlowStartingPoint = z.infer<typeof prototypeFlowStartingPointSchema>;
+
+export const setPrototypeSpecSchema = z.object({
+  links: z.array(prototypeLinkWriteSchema).max(256).default([]),
+  flowStartingPoints: z.array(prototypeFlowStartingPointSchema).max(64).default([]),
+}).strict().superRefine((spec, context) => {
+  if (!spec.links.length && !spec.flowStartingPoints.length) {
+    context.addIssue({ code: "custom", path: [], message: "Prototype authoring requires at least one link or flow starting point." });
+  }
+  const flowIds = new Set<string>();
+  spec.flowStartingPoints.forEach((flow, index) => {
+    if (flowIds.has(flow.nodeId)) {
+      context.addIssue({ code: "custom", path: ["flowStartingPoints", index, "nodeId"], message: `Duplicate flow starting point nodeId: ${flow.nodeId}.` });
+    }
+    flowIds.add(flow.nodeId);
+  });
+  if (JSON.stringify(spec).length > 512_000) {
+    context.addIssue({ code: "custom", path: [], message: "Prototype authoring payload exceeds the 512 KB limit." });
+  }
+});
+export type SetPrototypeSpec = z.infer<typeof setPrototypeSpecSchema>;
 
 export const screenSpecSchema = z.object({
   name: z.string().min(1).max(200),

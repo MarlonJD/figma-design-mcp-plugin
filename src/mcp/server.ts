@@ -8,6 +8,7 @@ import {
   hostKindSchema,
   captureScopeSchema,
   nodeTreeSpecSchema,
+  setPrototypeSpecSchema,
   type HostKind,
   visualContextSchema,
 } from "../core/ir.js";
@@ -51,6 +52,14 @@ const updateSelectionInput = z.object({
   documentId: z.string().min(1).optional(),
   patch: designPatchSchema,
   targetIds: z.array(z.string().min(1)).min(1).max(2000),
+  expectedSnapshotId: z.string().min(1),
+}).strict();
+
+const setPrototypeInput = setPrototypeSpecSchema.extend({
+  host: hostKindSchema.optional(),
+  sessionId: z.string().min(1).optional(),
+  captureSessionId: z.string().min(1),
+  documentId: z.string().min(1).optional(),
   expectedSnapshotId: z.string().min(1),
 }).strict();
 
@@ -220,7 +229,7 @@ async function callBridge<T>(
 export function createMcpServer(bridge: DesignPortBridge): McpServer {
   const server = new McpServer({
     name: "designport",
-    version: "0.5.0",
+    version: "0.6.0",
   });
 
   server.registerTool(
@@ -506,6 +515,23 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
         expectedSnapshotId,
         ...(documentId ? { documentId } : {}),
         sessionId: captureSessionId,
+      }),
+  );
+
+  server.registerTool(
+    "design.set_prototype",
+    {
+      title: "Set bounded native prototype links",
+      description: "Set or explicitly clear instant on-click links between same-page Figma frame IDs, and optionally set or clear named flow starting points. Sources must be in the complete expected capture; destinations may be outside that source-screen capture but must be top-level frames in the same document and page. sessionId selects the bridge connection; captureSessionId is the native session from snapshot.identity. The full batch is validated before mutation.",
+      inputSchema: setPrototypeInput.shape,
+    },
+    async ({ host, sessionId, captureSessionId, documentId, expectedSnapshotId, links, flowStartingPoints }) =>
+      callBridge(bridge, selectorFor(host, sessionId, documentId), "set_prototype", {
+        expectedSnapshotId,
+        ...(documentId ? { documentId } : {}),
+        sessionId: captureSessionId,
+        links,
+        flowStartingPoints,
       }),
   );
 

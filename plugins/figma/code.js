@@ -1,5 +1,5 @@
 const BRIDGE_PROTOCOL_VERSION = 2;
-const PLUGIN_VERSION = "0.5.0";
+const PLUGIN_VERSION = "0.6.0";
 const PAIRING_TOKEN = "designport-local-pairing";
 
 const CAPABILITIES = {
@@ -22,14 +22,15 @@ const CAPABILITIES = {
     "bounded-asset-retrieval",
     "capture-consistency",
     "node-tree-authoring",
+    "prototype-authoring",
+    "local-component-instance-authoring",
     "explicit-node-updates",
     "font-aware-text-updates",
     "auto-layout-authoring",
   ],
   limitations: [
     "solid-fill-authoring-only",
-    "prototype-authoring-deferred",
-    "component-instance-and-variant-authoring-deferred",
+    "component-variant-authoring-deferred",
     "font-weight-is-set-through-font-style",
   ],
   operations: [
@@ -45,6 +46,7 @@ const CAPABILITIES = {
     "create_component",
     "create_node_tree",
     "update_selection",
+    "set_prototype",
   ],
   supports: {
     documentRead: true,
@@ -53,6 +55,7 @@ const CAPABILITIES = {
     createComponent: true,
     createNodeTree: true,
     updateSelection: true,
+    setPrototype: true,
     userActionRequiredForWrite: false,
     visualRead: true,
   },
@@ -2199,6 +2202,9 @@ function assertNodeTreeSpec(spec) {
       throw writeError("AUTHORING_INVALID", "Every authored node needs a valid local reference.");
     }
     if (byRef.has(node.ref)) throw writeError("AUTHORING_INVALID", `Duplicate node reference: ${node.ref}.`);
+    if (!node.kind || !["frame", "text", "rectangle", "component", "instance"].includes(node.kind)) {
+      throw writeError("AUTHORING_INVALID", `Unsupported authored node kind: ${node.kind}.`);
+    }
     byRef.set(node.ref, node);
   });
 
@@ -2240,8 +2246,8 @@ function assertNodeTreeSpec(spec) {
       throw writeError("AUTHORING_INVALID", `Fill sizing requires an auto-layout parent (${node.ref}).`);
     }
     if ((layout.sizingHorizontal === "hug" || layout.sizingVertical === "hug")
-      && node.kind !== "text" && layout.mode === "none") {
-      throw writeError("AUTHORING_INVALID", `Hug sizing requires an auto-layout frame/component (${node.ref}).`);
+      && node.kind !== "text" && node.kind !== "instance" && layout.mode === "none") {
+      throw writeError("AUTHORING_INVALID", `Hug sizing requires an auto-layout frame/component/instance (${node.ref}).`);
     }
     if (parentMode && node.positioning !== "absolute" && (node.x !== undefined || node.y !== undefined)) {
       throw writeError("AUTHORING_INVALID", `Flow child ${node.ref} cannot set x/y without absolute positioning.`);
@@ -2251,6 +2257,22 @@ function assertNodeTreeSpec(spec) {
     }
     if (node.kind !== "text" && (node.text !== undefined || node.typography !== undefined)) {
       throw writeError("AUTHORING_INVALID", `Only text nodes may set text or typography (${node.ref}).`);
+    }
+    if (node.kind === "instance" && typeof node.componentId !== "string") {
+      throw writeError("AUTHORING_INVALID", `Instance ${node.ref} requires an existing local componentId.`);
+    }
+    if (node.kind !== "instance" && (node.componentId !== undefined || node.textOverrides !== undefined)) {
+      throw writeError("AUTHORING_INVALID", `componentId and textOverrides are only valid for instance nodes (${node.ref}).`);
+    }
+    if (node.kind === "instance" && (node.fill !== undefined || node.stroke !== undefined
+      || node.cornerRadius !== undefined || node.cornerRadii !== undefined || node.clipsContent !== undefined)) {
+      throw writeError("AUTHORING_INVALID", `Instance ${node.ref} only supports native sizing, positioning, visibility, and exposed text overrides.`);
+    }
+    if (node.kind === "instance" && node.textOverrides && Object.keys(node.textOverrides).length > 8) {
+      throw writeError("AUTHORING_INVALID", `Instance ${node.ref} may override at most 8 exposed text properties.`);
+    }
+    if (node.kind === "instance" && node.textOverrides && JSON.stringify(node.textOverrides).length > 20000) {
+      throw writeError("AUTHORING_INVALID", `Instance ${node.ref} text overrides exceed the 20 KB limit.`);
     }
     if (node.positioning === "absolute" && !parentMode) {
       throw writeError("AUTHORING_INVALID", `Absolute positioning requires an auto-layout parent (${node.ref}).`);
@@ -2506,12 +2528,66 @@ async function applyPatch(node, patch) {
   }
 }
 
+function documentAncestor(node) {
+  let current = node;
+  while (current && current.parent) current = current.parent;
+  return current;
+}
+
+function localComponentForInstance(spec) {
+  const component = figma.getNodeById(spec.componentId);
+  if (!component || component.type !== "COMPONENT") {
+    throw writeError("INSTANCE_COMPONENT_UNAVAILABLE", `Component ${spec.componentId} is unavailable or is not a component.`);
+  }
+  if (component.remote === true) {
+    throw writeError("INSTANCE_COMPONENT_REMOTE", `Component ${spec.componentId} is remote; only local components are supported.`);
+  }
+  if (documentAncestor(component) !== figma.root) {
+    throw writeError("INSTANCE_COMPONENT_DOCUMENT_MISMATCH", `Component ${spec.componentId} is not in the connected document.`);
+  }
+  if (typeof component.createInstance !== "function") {
+    throw writeError("INSTANCE_AUTHORING_UNSUPPORTED", "The connected Figma host cannot create local component instances.");
+  }
+  return component;
+}
+
+function applyInstanceTextOverrides(node, overrides) {
+  if (!overrides) return;
+  if (typeof node.setProperties !== "function") {
+    throw writeError("INSTANCE_TEXT_OVERRIDE_UNSUPPORTED", "The connected Figma host cannot set instance text properties.");
+  }
+  const properties = node.componentProperties || {};
+  Object.entries(overrides).forEach(([key, value]) => {
+    const property = properties[key];
+    if (!property || property.type !== "TEXT") {
+      throw writeError("INSTANCE_TEXT_OVERRIDE_UNAVAILABLE", `Instance text property ${key} is not exposed by the component.`);
+    }
+    if (typeof value !== "string") {
+      throw writeError("INSTANCE_TEXT_OVERRIDE_INVALID", `Instance text property ${key} must be a string.`);
+    }
+  });
+  node.setProperties(overrides);
+}
+
+function descendantIds(node) {
+  const ids = [];
+  const pending = childrenOf(node).slice();
+  while (pending.length) {
+    const child = pending.shift();
+    if (!child || !child.id) continue;
+    ids.push(child.id);
+    pending.unshift(...childrenOf(child));
+  }
+  return ids;
+}
+
 async function createAuthoredNode(spec, created) {
   let node;
   if (spec.kind === "frame") node = figma.createFrame();
   else if (spec.kind === "rectangle") node = figma.createRectangle();
   else if (spec.kind === "component") node = figma.createComponent();
   else if (spec.kind === "text") node = figma.createText();
+  else if (spec.kind === "instance") node = localComponentForInstance(spec).createInstance();
   else throw writeError("AUTHORING_INVALID", `Unsupported authored node kind: ${spec.kind}.`);
   created.push(node);
 
@@ -2522,7 +2598,8 @@ async function createAuthoredNode(spec, created) {
         ? "WIDTH_AND_HEIGHT" : spec.typography.autoResize === "height" ? "HEIGHT" : spec.typography.autoResize === "truncate" ? "TRUNCATE" : "NONE";
     }
   }
-  applyLayoutMode(node, spec.layout);
+  if (spec.kind !== "instance") applyLayoutMode(node, spec.layout);
+  if (spec.kind === "instance") applyInstanceTextOverrides(node, spec.textOverrides);
   if (Number.isFinite(spec.width) || Number.isFinite(spec.height)) {
     const width = Number.isFinite(spec.width) ? spec.width : node.width || 100;
     const height = Number.isFinite(spec.height) ? spec.height : node.height || 100;
@@ -2583,7 +2660,12 @@ async function createNodeTree(spec) {
     throw error;
   }
   const referenceMap = Object.fromEntries(spec.nodes.map((item) => [item.ref, createdByRef.get(item.ref).id]));
-  const createdNodeIds = spec.nodes.map((item) => createdByRef.get(item.ref).id);
+  const createdNodeIds = [];
+  spec.nodes.forEach((item) => {
+    const node = createdByRef.get(item.ref);
+    createdNodeIds.push(node.id);
+    if (item.kind === "instance") createdNodeIds.push(...descendantIds(node));
+  });
   const rootNodeIds = spec.nodes.filter((item) => !item.parentRef).map((item) => createdByRef.get(item.ref).id);
   return {
     status: "applied",
@@ -2594,6 +2676,7 @@ async function createNodeTree(spec) {
       reference: item.ref,
       node: ref(createdByRef.get(item.ref).id),
       ...(item.parentRef ? { parentReference: item.parentRef } : {}),
+      ...(item.kind === "instance" ? { descendantIds: descendantIds(createdByRef.get(item.ref)) } : {}),
     })),
     kind: "node-tree",
   };
@@ -2665,6 +2748,281 @@ function validateWriteState(payload, operation) {
   return baseline;
 }
 
+function clonePrototypeValue(value) {
+  return value === undefined ? value : JSON.parse(JSON.stringify(value));
+}
+
+function nodeIsInDocument(node) {
+  return Boolean(node && documentAncestor(node) === figma.root);
+}
+
+function nodeIsOnCurrentPage(node) {
+  let current = node;
+  while (current && current.type !== "PAGE") current = current.parent;
+  return current === figma.currentPage;
+}
+
+function topLevelPrototypeFrame(node) {
+  return Boolean(node && node.type === "FRAME" && node.parent === figma.currentPage && nodeIsInDocument(node));
+}
+
+function containingTopLevelPrototypeFrame(node) {
+  let current = node;
+  while (current && current.type !== "PAGE") {
+    if (topLevelPrototypeFrame(current)) return current;
+    current = current.parent;
+  }
+  return null;
+}
+
+function validatePrototypeRequest(payload, baseline) {
+  const links = Array.isArray(payload && payload.links) ? payload.links : [];
+  const flowStartingPoints = Array.isArray(payload && payload.flowStartingPoints) ? payload.flowStartingPoints : [];
+  if (!links.length && !flowStartingPoints.length) {
+    throw writeError("PROTOTYPE_INVALID", "Prototype authoring requires at least one link or flow starting point.");
+  }
+  if (links.length > 256 || flowStartingPoints.length > 64) {
+    throw writeError("PROTOTYPE_INVALID", "Prototype authoring batches are limited to 256 links and 64 flow starting points.");
+  }
+  if (JSON.stringify({ links, flowStartingPoints }).length > 512000) {
+    throw writeError("PROTOTYPE_PAYLOAD_TOO_LARGE", "Prototype authoring payload exceeds the 512 KB limit.");
+  }
+
+  const capturedIds = new Set((baseline.nodes || []).map((node) => node.id));
+  const resolvedLinks = [];
+  const affectedNodeIds = new Set();
+  const sourceNodes = new Map();
+  links.forEach((link) => {
+    if (!link || typeof link.sourceNodeId !== "string" || !link.sourceNodeId) {
+      throw writeError("PROTOTYPE_INVALID", "Every prototype link needs an explicit sourceNodeId.");
+    }
+    if (!capturedIds.has(link.sourceNodeId)) {
+      throw writeError("WRITE_TARGET_MISMATCH", "Prototype link sources must be explicit nodes in the expected complete capture scope.");
+    }
+    const source = figma.getNodeById(link.sourceNodeId);
+    if (!source || !nodeIsOnCurrentPage(source)) {
+      throw writeError("PROTOTYPE_SOURCE_UNAVAILABLE", `Prototype source ${link.sourceNodeId} is unavailable on the captured page.`);
+    }
+    if (["DOCUMENT", "PAGE"].includes(source.type)
+      || typeof source.setReactionsAsync !== "function" || !Array.isArray(source.reactions)) {
+      throw writeError("PROTOTYPE_SOURCE_UNSUPPORTED", `Prototype source ${link.sourceNodeId} cannot set native reactions.`);
+    }
+    if (link.mode !== "set" && link.mode !== "clear") {
+      throw writeError("PROTOTYPE_INVALID", "Prototype link mode must be set or clear.");
+    }
+    if (link.trigger !== undefined && link.trigger !== "on_click") {
+      throw writeError("PROTOTYPE_INVALID", "Only on_click prototype triggers are supported.");
+    }
+    if (link.transition !== undefined && link.transition !== "instant") {
+      throw writeError("PROTOTYPE_INVALID", "Only instant prototype transitions are supported.");
+    }
+    if (link.mode === "set") {
+      if (typeof link.destinationNodeId !== "string" || !link.destinationNodeId) {
+        throw writeError("PROTOTYPE_INVALID", "Setting a prototype link requires destinationNodeId.");
+      }
+      if (link.clearScope !== undefined) {
+        throw writeError("PROTOTYPE_INVALID", "clearScope is only valid when clearing a prototype link.");
+      }
+      const destination = figma.getNodeById(link.destinationNodeId);
+      if (!topLevelPrototypeFrame(destination)) {
+        throw writeError("PROTOTYPE_DESTINATION_INVALID", `Prototype destination ${link.destinationNodeId} must be a top-level frame on the current Figma page.`);
+      }
+      const sourceScreen = containingTopLevelPrototypeFrame(source);
+      if (sourceScreen && sourceScreen.id === destination.id) {
+        throw writeError("PROTOTYPE_SELF_LINK", "Prototype navigation destination must be a different top-level frame from the source.");
+      }
+      affectedNodeIds.add(link.destinationNodeId);
+      resolvedLinks.push({ link, source, destination });
+    } else {
+      if (link.clearScope !== "matching" && link.clearScope !== "all") {
+        throw writeError("PROTOTYPE_INVALID", "Clearing a prototype link requires clearScope=matching or clearScope=all.");
+      }
+      if (link.clearScope === "matching") {
+        if (typeof link.destinationNodeId !== "string" || !link.destinationNodeId) {
+          throw writeError("PROTOTYPE_INVALID", "Matching clear requires destinationNodeId.");
+        }
+        const destination = figma.getNodeById(link.destinationNodeId);
+        if (!topLevelPrototypeFrame(destination)) {
+          throw writeError("PROTOTYPE_DESTINATION_INVALID", `Prototype destination ${link.destinationNodeId} must be a top-level frame on the current Figma page.`);
+        }
+        affectedNodeIds.add(link.destinationNodeId);
+        resolvedLinks.push({ link, source, destination });
+      } else {
+        if (link.destinationNodeId !== undefined) {
+          throw writeError("PROTOTYPE_INVALID", "All-link clear cannot include destinationNodeId.");
+        }
+        resolvedLinks.push({ link, source });
+      }
+    }
+    sourceNodes.set(source.id, source);
+    affectedNodeIds.add(source.id);
+  });
+
+  const seenFlowIds = new Set();
+  const resolvedFlows = flowStartingPoints.map((flow) => {
+    if (!flow || typeof flow.nodeId !== "string" || !flow.nodeId) {
+      throw writeError("PROTOTYPE_INVALID", "Every flow starting point needs an explicit nodeId.");
+    }
+    if (seenFlowIds.has(flow.nodeId)) {
+      throw writeError("PROTOTYPE_INVALID", `Duplicate flow starting point nodeId: ${flow.nodeId}.`);
+    }
+    seenFlowIds.add(flow.nodeId);
+    if (flow.mode !== "set" && flow.mode !== "clear") {
+      throw writeError("PROTOTYPE_INVALID", "Flow starting point mode must be set or clear.");
+    }
+    if (flow.mode === "set" && (typeof flow.name !== "string" || !flow.name)) {
+      throw writeError("PROTOTYPE_INVALID", "Setting a flow starting point requires a name.");
+    }
+    if (flow.mode === "clear" && flow.name !== undefined) {
+      throw writeError("PROTOTYPE_INVALID", "Clearing a flow starting point cannot include a name.");
+    }
+    const node = figma.getNodeById(flow.nodeId);
+    if (!topLevelPrototypeFrame(node)) {
+      throw writeError("PROTOTYPE_FLOW_INVALID", `Flow starting point ${flow.nodeId} must be a top-level frame on the current Figma page.`);
+    }
+    affectedNodeIds.add(flow.nodeId);
+    return { flow, node };
+  });
+
+  return {
+    links: resolvedLinks,
+    flows: resolvedFlows,
+    sourceNodes,
+    affectedNodeIds: [...affectedNodeIds],
+  };
+}
+
+function matchingPrototypeAction(action, destinationNodeId) {
+  return Boolean(action
+    && action.type === "NODE"
+    && action.destinationId === destinationNodeId
+    && action.navigation === "NAVIGATE");
+}
+
+function clearMatchingPrototypeReactions(reactions, destinationNodeId) {
+  let cleared = 0;
+  const next = [];
+  reactions.forEach((reaction) => {
+    if (!reaction || !reaction.trigger || reaction.trigger.type !== "ON_CLICK") {
+      next.push(reaction);
+      return;
+    }
+    if (Array.isArray(reaction.actions)) {
+      const actions = reaction.actions.filter((action) => {
+        const matches = matchingPrototypeAction(action, destinationNodeId);
+        if (matches) cleared += 1;
+        return !matches;
+      });
+      if (actions.length) next.push(actions.length === reaction.actions.length ? reaction : { ...reaction, actions });
+      return;
+    }
+    if (matchingPrototypeAction(reaction.action, destinationNodeId)) {
+      cleared += 1;
+      return;
+    }
+    next.push(reaction);
+  });
+  return { reactions: next, cleared };
+}
+
+function countPrototypeActions(reactions) {
+  return reactions.reduce((count, reaction) => count + (Array.isArray(reaction && reaction.actions)
+    ? reaction.actions.length
+    : reaction && reaction.action ? 1 : 0), 0);
+}
+
+async function setPrototype(payload, baseline) {
+  const validated = validatePrototypeRequest(payload, baseline);
+  const reactionState = new Map();
+  validated.sourceNodes.forEach((node, id) => {
+    const before = clonePrototypeValue(node.reactions || []);
+    reactionState.set(id, { node, before, next: clonePrototypeValue(before) });
+  });
+  const beforeFlows = clonePrototypeValue(Array.isArray(figma.currentPage.flowStartingPoints)
+    ? figma.currentPage.flowStartingPoints
+    : []);
+  const nextFlows = clonePrototypeValue(beforeFlows);
+  let linksSet = 0;
+  let linksCleared = 0;
+  let flowsSet = 0;
+  let flowsCleared = 0;
+
+  validated.links.forEach(({ link, source }) => {
+    const state = reactionState.get(source.id);
+    if (link.mode === "set") {
+      state.next.push({
+        trigger: { type: "ON_CLICK" },
+        actions: [{
+          type: "NODE",
+          destinationId: link.destinationNodeId,
+          navigation: "NAVIGATE",
+          transition: null,
+        }],
+      });
+      linksSet += 1;
+    } else if (link.clearScope === "all") {
+      linksCleared += countPrototypeActions(state.next);
+      state.next = [];
+    } else {
+      const result = clearMatchingPrototypeReactions(state.next, link.destinationNodeId);
+      state.next = result.reactions;
+      linksCleared += result.cleared;
+    }
+  });
+
+  validated.flows.forEach(({ flow }) => {
+    const index = nextFlows.findIndex((entry) => entry && entry.nodeId === flow.nodeId);
+    if (flow.mode === "set") {
+      const entry = { nodeId: flow.nodeId, name: flow.name };
+      if (index >= 0) nextFlows[index] = entry;
+      else nextFlows.push(entry);
+      flowsSet += 1;
+    } else if (index >= 0) {
+      nextFlows.splice(index, 1);
+      flowsCleared += 1;
+    }
+  });
+
+  const changedReactions = [...reactionState.values()].filter((state) => JSON.stringify(state.before) !== JSON.stringify(state.next));
+  const changedFlows = JSON.stringify(beforeFlows) !== JSON.stringify(nextFlows);
+  try {
+    for (const state of changedReactions) await state.node.setReactionsAsync(state.next);
+    if (changedFlows) figma.currentPage.flowStartingPoints = nextFlows;
+  } catch (error) {
+    const rollbackErrors = [];
+    for (const state of changedReactions) {
+      try {
+        await state.node.setReactionsAsync(state.before);
+      } catch (rollbackError) {
+        rollbackErrors.push(String(rollbackError && rollbackError.message || rollbackError));
+      }
+    }
+    if (changedFlows) {
+      try {
+        figma.currentPage.flowStartingPoints = beforeFlows;
+      } catch (rollbackError) {
+        rollbackErrors.push(String(rollbackError && rollbackError.message || rollbackError));
+      }
+    }
+    if (rollbackErrors.length) {
+      throw writeError("PROTOTYPE_ROLLBACK_FAILED", "Prototype write failed and native rollback was incomplete.", {
+        originalError: String(error && error.message || error),
+        rollbackErrors,
+      });
+    }
+    throw error;
+  }
+
+  return {
+    status: "applied",
+    affectedNodeIds: validated.affectedNodeIds,
+    linksSet,
+    linksCleared,
+    flowsSet,
+    flowsCleared,
+  };
+}
+
 async function executeWrite(operation, payload) {
   const baseline = validateWriteState(payload || {}, operation);
   if (operation === "create_screen") {
@@ -2680,6 +3038,7 @@ async function executeWrite(operation, payload) {
   }
   if (operation === "create_component") return createComponent(payload || {});
   if (operation === "create_node_tree") return createNodeTree(payload || {});
+  if (operation === "set_prototype") return setPrototype(payload || {}, baseline);
   if (operation === "update_selection") {
     const targetIds = Array.isArray(payload && payload.targetIds) ? payload.targetIds : [];
     const items = targetIds.map((id) => figma.getNodeById(id)).filter(Boolean);
@@ -2797,6 +3156,7 @@ async function handleRequest(request) {
       case "create_component":
       case "create_node_tree":
       case "update_selection":
+      case "set_prototype":
         result = await executeWrite(request.operation, request.payload);
         break;
       default:

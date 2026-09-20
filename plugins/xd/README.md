@@ -50,6 +50,10 @@ the supported name, visibility, opacity, solid-fill, text, and geometry fields;
 typography, Auto Layout, reparenting, stroke, and corner authoring are rejected
 with an explicit unsupported-field error rather than being silently ignored.
 
+Bounded prototype authoring is likewise unsupported on XD. XD reports
+`setPrototype: false`, omits `set_prototype` from its operation list, and
+rejects a direct request with `XD_PROTOTYPE_AUTHORING_UNSUPPORTED`.
+
 XD does not expose every Figma component-state concept through its public UXP
 surface. Unsupported component creation and unavailable state data are
 reported as limitations; the adapter never substitutes a plain group or

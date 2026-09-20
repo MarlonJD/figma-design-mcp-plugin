@@ -69,7 +69,9 @@ test("Figma entrypoint emits authenticated v2 hello and bounded invalidation eve
   assert.equal(hello.host, "figma");
   assert.equal(hello.pairingToken, "designport-local-pairing");
   assert.equal(hello.capabilities?.supports.createNodeTree, true);
+  assert.equal(hello.capabilities?.supports.setPrototype, true);
   assert.equal(hello.capabilities?.operations.includes("create_node_tree"), true);
+  assert.equal(hello.capabilities?.operations.includes("set_prototype"), true);
 
   listeners.get("selectionchange")!();
   const selectionEnvelope = uiMessages.at(-1) as { value: unknown };
@@ -144,7 +146,9 @@ test("XD entrypoint sends the v2 pairing handshake through its real setup", asyn
   assert.equal(hello.host, "xd");
   assert.equal(hello.pairingToken, "designport-local-pairing");
   assert.equal(hello.capabilities?.supports.createNodeTree, false);
+  assert.equal(hello.capabilities?.supports.setPrototype, false);
   assert.equal(hello.capabilities?.operations.includes("create_node_tree"), false);
+  assert.equal(hello.capabilities?.operations.includes("set_prototype"), false);
   assert.equal(hello.capabilities?.limitations?.includes("node-tree-authoring-unsupported"), true);
   socket!.onmessage!({
     data: JSON.stringify({
@@ -158,6 +162,18 @@ test("XD entrypoint sends the v2 pairing handshake through its real setup", asyn
   const unsupported = socket!.sent.at(-1) as { ok?: boolean; error?: { code?: string } };
   assert.equal(unsupported.ok, false);
   assert.equal(unsupported.error?.code, "XD_NODE_TREE_AUTHORING_UNSUPPORTED");
+  socket!.onmessage!({
+    data: JSON.stringify({
+      type: "request",
+      requestId: "xd-prototype",
+      operation: "set_prototype",
+      payload: {},
+    }),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const unsupportedPrototype = socket!.sent.at(-1) as { ok?: boolean; error?: { code?: string } };
+  assert.equal(unsupportedPrototype.ok, false);
+  assert.equal(unsupportedPrototype.error?.code, "XD_PROTOTYPE_AUTHORING_UNSUPPORTED");
 });
 
 test("Figma entrypoint creates a bounded nested tree, orders auto layout, updates explicit IDs, and cleans up failed tasks", async () => {
@@ -167,6 +183,9 @@ test("Figma entrypoint creates a bounded nested tree, orders auto layout, update
   const nodes = new Map<string, MockNode>();
   const log: string[] = [];
   let nextId = 1;
+  let flowStartingPoints: Array<{ nodeId: string; name: string }> = [];
+  let failNextFlowStartingPoints = false;
+  let reactionSetterCalls = 0;
 
   class MockNode {
     [key: string]: any;
@@ -193,6 +212,8 @@ test("Figma entrypoint creates a bounded nested tree, orders auto layout, update
     layoutGrow = 0;
     layoutPositioning = "AUTO";
     layoutMode = "NONE";
+    reactions: any[] = [];
+    componentProperties: Record<string, { type: string; value: string }> = {};
     hasMissingFont = false;
     autoRename = false;
 
@@ -256,6 +277,38 @@ test("Figma entrypoint creates a bounded nested tree, orders auto layout, update
       this.children.push(child);
     }
 
+    async setReactionsAsync(reactions: any[]) {
+      reactionSetterCalls += 1;
+      if (this.failNextReactions) {
+        this.failNextReactions = false;
+        throw new Error("native reaction setter failed");
+      }
+      this.reactions = JSON.parse(JSON.stringify(reactions));
+      log.push(`${this.id}:reactions=${this.reactions.length}`);
+    }
+
+    setProperties(properties: Record<string, string>) {
+      Object.entries(properties).forEach(([key, value]) => {
+        if (!this.componentProperties[key] || this.componentProperties[key].type !== "TEXT") {
+          throw new Error(`Unknown component property ${key}`);
+        }
+        this.componentProperties[key].value = value;
+        const textChild = this.children.find((child) => child.type === "TEXT");
+        if (textChild) textChild.characters = value;
+      });
+    }
+
+    createInstance() {
+      if (this.type !== "COMPONENT") throw new Error("Only components can create instances");
+      const instance = addNewNode("INSTANCE");
+      instance.componentProperties = { "Label#0:0": { type: "TEXT", value: "Component label" } };
+      const label = new MockNode("TEXT", `node-${nextId++}`, "Label");
+      nodes.set(label.id, label);
+      label.characters = "Component label";
+      instance.appendChild(label);
+      return instance;
+    }
+
     remove() {
       this.removed = true;
       if (this.parent) this.parent.children = this.parent.children.filter((item) => item !== this);
@@ -269,6 +322,17 @@ test("Figma entrypoint creates a bounded nested tree, orders auto layout, update
 
   const documentNode = new MockNode("DOCUMENT", "document-1", "Fixture");
   const page = new MockNode("PAGE", "page-1", "Page 1");
+  Object.defineProperty(page, "flowStartingPoints", {
+    configurable: true,
+    get: () => flowStartingPoints,
+    set: (value: Array<{ nodeId: string; name: string }>) => {
+      if (failNextFlowStartingPoints) {
+        failNextFlowStartingPoints = false;
+        throw new Error("native flow setter failed");
+      }
+      flowStartingPoints = value;
+    },
+  });
   page.parent = documentNode;
   documentNode.children = [page];
   nodes.set(documentNode.id, documentNode);
@@ -281,6 +345,14 @@ test("Figma entrypoint creates a bounded nested tree, orders auto layout, update
     nodes.set(node.id, node);
     return node;
   };
+
+  const localComponent = addNewNode("COMPONENT");
+  localComponent.name = "Reusable button";
+  const prototypeDestination = addNewNode("FRAME");
+  prototypeDestination.name = "Destination screen";
+  const selfLinkSource = new MockNode("INSTANCE", "self-link-source", "Self-link source");
+  nodes.set(selfLinkSource.id, selfLinkSource);
+  prototypeDestination.appendChild(selfLinkSource);
 
   const figma = {
     showUI() {},
@@ -474,4 +546,249 @@ test("Figma entrypoint creates a bounded nested tree, orders auto layout, update
   assert.equal(failed.ok, false);
   assert.deepEqual(page.children.map((node) => node.id), beforeFailureIds);
   assert.equal([...nodes.values()].some((node) => node.name === "Failed screen"), false);
+
+  const prototypeCapture = await sendRequest("prototype-capture", "export_ir", {
+    scope: "screen",
+    screenId: created.result.referenceMap.screen,
+    options: { includeAssets: false, includeTokens: false, detail: "full" },
+  });
+  assert.equal(prototypeCapture.ok, true);
+  const prototypeSnapshotId = prototypeCapture.result.snapshot.id;
+  const sourceTitle = nodes.get(created.result.referenceMap.title)!;
+  const sourceHug = nodes.get(created.result.referenceMap["hug-copy"])!;
+
+  const selfLinkCapture = await sendRequest("prototype-self-link-capture", "export_ir", {
+    scope: "document",
+    options: { includeAssets: false, includeTokens: false, detail: "full" },
+  });
+  assert.equal(selfLinkCapture.ok, true);
+  const setterCallsBeforeSelfLink = reactionSetterCalls;
+  const selfLinkBatch = await sendRequest("prototype-self-link-batch", "set_prototype", {
+    expectedSnapshotId: selfLinkCapture.result.snapshot.id,
+    sessionId: selfLinkCapture.result.captureIdentity.sessionId,
+    links: [
+      {
+        sourceNodeId: sourceTitle.id,
+        destinationNodeId: prototypeDestination.id,
+        mode: "set",
+        trigger: "on_click",
+        transition: "instant",
+      },
+      {
+        sourceNodeId: selfLinkSource.id,
+        destinationNodeId: prototypeDestination.id,
+        mode: "set",
+        trigger: "on_click",
+        transition: "instant",
+      },
+    ],
+    flowStartingPoints: [],
+  });
+  assert.equal(selfLinkBatch.ok, false);
+  assert.equal(selfLinkBatch.error.code, "PROTOTYPE_SELF_LINK");
+  assert.equal(reactionSetterCalls, setterCallsBeforeSelfLink);
+  assert.deepEqual(sourceTitle.reactions, []);
+  assert.deepEqual(selfLinkSource.reactions, []);
+
+  const invalidDestination = await sendRequest("prototype-invalid-destination", "set_prototype", {
+    expectedSnapshotId: prototypeSnapshotId,
+    sessionId: prototypeCapture.result.captureIdentity.sessionId,
+    links: [{
+      sourceNodeId: sourceTitle.id,
+      destinationNodeId: sourceTitle.id,
+      mode: "set",
+      trigger: "on_click",
+      transition: "instant",
+    }],
+    flowStartingPoints: [],
+  });
+  assert.equal(invalidDestination.ok, false);
+  assert.equal(invalidDestination.error.code, "PROTOTYPE_DESTINATION_INVALID");
+  assert.deepEqual(sourceTitle.reactions, []);
+
+  const outOfScopeSource = await sendRequest("prototype-out-of-scope-source", "set_prototype", {
+    expectedSnapshotId: prototypeSnapshotId,
+    sessionId: prototypeCapture.result.captureIdentity.sessionId,
+    links: [{
+      sourceNodeId: prototypeDestination.id,
+      destinationNodeId: prototypeDestination.id,
+      mode: "set",
+      trigger: "on_click",
+      transition: "instant",
+    }],
+    flowStartingPoints: [],
+  });
+  assert.equal(outOfScopeSource.ok, false);
+  assert.equal(outOfScopeSource.error.code, "WRITE_TARGET_MISMATCH");
+
+  const sessionMismatchPrototype = await sendRequest("prototype-session-mismatch", "set_prototype", {
+    expectedSnapshotId: prototypeSnapshotId,
+    sessionId: "bridge-connection-session",
+    links: [{
+      sourceNodeId: sourceTitle.id,
+      destinationNodeId: prototypeDestination.id,
+      mode: "set",
+      trigger: "on_click",
+      transition: "instant",
+    }],
+    flowStartingPoints: [],
+  });
+  assert.equal(sessionMismatchPrototype.ok, false);
+  assert.equal(sessionMismatchPrototype.error.code, "WRITE_SESSION_MISMATCH");
+
+  sourceHug.failNextReactions = true;
+  const failedPrototype = await sendRequest("prototype-rollback", "set_prototype", {
+    expectedSnapshotId: prototypeSnapshotId,
+    sessionId: prototypeCapture.result.captureIdentity.sessionId,
+    links: [
+      {
+        sourceNodeId: sourceTitle.id,
+        destinationNodeId: prototypeDestination.id,
+        mode: "set",
+        trigger: "on_click",
+        transition: "instant",
+      },
+      {
+        sourceNodeId: sourceHug.id,
+        destinationNodeId: prototypeDestination.id,
+        mode: "set",
+        trigger: "on_click",
+        transition: "instant",
+      },
+    ],
+    flowStartingPoints: [],
+  });
+  assert.equal(failedPrototype.ok, false);
+  assert.equal(failedPrototype.error.message, "native reaction setter failed");
+  assert.deepEqual(sourceTitle.reactions, []);
+  assert.deepEqual(sourceHug.reactions, []);
+
+  const appliedPrototype = await sendRequest("prototype-apply", "set_prototype", {
+    expectedSnapshotId: prototypeSnapshotId,
+    sessionId: prototypeCapture.result.captureIdentity.sessionId,
+    links: [{
+      sourceNodeId: sourceTitle.id,
+      destinationNodeId: prototypeDestination.id,
+      mode: "set",
+      trigger: "on_click",
+      transition: "instant",
+    }],
+    flowStartingPoints: [{ nodeId: prototypeDestination.id, name: "Destination", mode: "set" }],
+  });
+  assert.equal(appliedPrototype.ok, true, JSON.stringify(appliedPrototype));
+  assert.equal(appliedPrototype.result.linksSet, 1);
+  assert.equal(appliedPrototype.result.flowsSet, 1);
+  const appliedReaction = sourceTitle.reactions[0] as unknown as { actions: Array<{ destinationId: string }> };
+  assert.equal(appliedReaction.actions[0]!.destinationId, prototypeDestination.id);
+  assert.equal(page.flowStartingPoints.length, 1);
+  assert.equal(page.flowStartingPoints[0].nodeId, prototypeDestination.id);
+  assert.equal(page.flowStartingPoints[0].name, "Destination");
+
+  failNextFlowStartingPoints = true;
+  const failedFlowPrototype = await sendRequest("prototype-flow-rollback", "set_prototype", {
+    expectedSnapshotId: prototypeSnapshotId,
+    sessionId: prototypeCapture.result.captureIdentity.sessionId,
+    links: [{
+      sourceNodeId: sourceHug.id,
+      destinationNodeId: prototypeDestination.id,
+      mode: "set",
+      trigger: "on_click",
+      transition: "instant",
+    }],
+    flowStartingPoints: [{ nodeId: prototypeDestination.id, name: "Changed", mode: "set" }],
+  });
+  assert.equal(failedFlowPrototype.ok, false);
+  assert.equal(failedFlowPrototype.error.message, "native flow setter failed");
+  assert.deepEqual(sourceHug.reactions, []);
+  assert.equal(page.flowStartingPoints[0].name, "Destination");
+
+  sourceTitle.reactions = [
+    {
+      trigger: { type: "ON_CLICK" },
+      actions: [
+        { type: "NODE", destinationId: prototypeDestination.id, navigation: "NAVIGATE", transition: null },
+        { type: "NODE", destinationId: "other-frame", navigation: "NAVIGATE", transition: null },
+      ],
+    },
+    {
+      trigger: { type: "ON_HOVER" },
+      actions: [{ type: "NODE", destinationId: prototypeDestination.id, navigation: "NAVIGATE", transition: null }],
+    },
+  ];
+  const clearCapture = await sendRequest("prototype-clear-capture", "export_ir", {
+    scope: "screen",
+    screenId: created.result.referenceMap.screen,
+    options: { includeAssets: false, includeTokens: false, detail: "full" },
+  });
+  const clearedPrototype = await sendRequest("prototype-clear", "set_prototype", {
+    expectedSnapshotId: clearCapture.result.snapshot.id,
+    sessionId: clearCapture.result.captureIdentity.sessionId,
+    links: [{
+      sourceNodeId: sourceTitle.id,
+      destinationNodeId: prototypeDestination.id,
+      mode: "clear",
+      clearScope: "matching",
+    }],
+    flowStartingPoints: [],
+  });
+  assert.equal(clearedPrototype.ok, true);
+  assert.equal(clearedPrototype.result.linksCleared, 1);
+  assert.equal(sourceTitle.reactions.length, 2);
+  assert.equal(sourceTitle.reactions[0].actions.length, 1);
+  assert.equal(sourceTitle.reactions[0].actions[0].destinationId, "other-frame");
+  assert.equal(sourceTitle.reactions[1].trigger.type, "ON_HOVER");
+
+  const instanceBaseline = await sendRequest("instance-capture", "export_ir", {
+    scope: "document",
+    options: { includeAssets: false, includeTokens: false, detail: "structure" },
+  });
+  const beforeInstanceIds = page.children.map((node) => node.id);
+  const instance = await sendRequest("create-instance", "create_node_tree", {
+    expectedSnapshotId: instanceBaseline.result.snapshot.id,
+    nodes: [{
+      ref: "button-instance",
+      kind: "instance",
+      name: "Open destination",
+      componentId: localComponent.id,
+      width: 220,
+      height: 52,
+      textOverrides: { "Label#0:0": "Open destination" },
+    }],
+  });
+  assert.equal(instance.ok, true, JSON.stringify(instance));
+  assert.equal(instance.result.createdNodeIds.length, 2);
+  assert.equal(instance.result.nodes[0].descendantIds.length, 1);
+  const instanceNode = nodes.get(instance.result.referenceMap["button-instance"])!;
+  assert.equal(instanceNode.componentProperties["Label#0:0"]!.value, "Open destination");
+
+  const beforeMissingComponentIds = page.children.map((node) => node.id);
+  const missingComponent = await sendRequest("missing-instance-component", "create_node_tree", {
+    expectedSnapshotId: instanceBaseline.result.snapshot.id,
+    nodes: [{ ref: "missing-instance", kind: "instance", name: "Missing", componentId: "missing-component" }],
+  });
+  assert.equal(missingComponent.ok, false);
+  assert.equal(missingComponent.error.code, "INSTANCE_COMPONENT_UNAVAILABLE");
+  assert.deepEqual(page.children.map((node) => node.id), beforeMissingComponentIds);
+
+  const wrongComponent = await sendRequest("wrong-instance-component", "create_node_tree", {
+    expectedSnapshotId: instanceBaseline.result.snapshot.id,
+    nodes: [{ ref: "wrong-instance", kind: "instance", name: "Wrong", componentId: sourceTitle.id }],
+  });
+  assert.equal(wrongComponent.ok, false);
+  assert.equal(wrongComponent.error.code, "INSTANCE_COMPONENT_UNAVAILABLE");
+  assert.deepEqual(page.children.map((node) => node.id), beforeMissingComponentIds);
+
+  const failedInstance = await sendRequest("failed-instance-override", "create_node_tree", {
+    expectedSnapshotId: instanceBaseline.result.snapshot.id,
+    nodes: [{
+      ref: "failed-instance",
+      kind: "instance",
+      name: "Failed override",
+      componentId: localComponent.id,
+      textOverrides: { "Missing#0:0": "Must clean up" },
+    }],
+  });
+  assert.equal(failedInstance.ok, false);
+  assert.equal(failedInstance.error.code, "INSTANCE_TEXT_OVERRIDE_UNAVAILABLE");
+  assert.deepEqual(page.children.map((node) => node.id), [...beforeInstanceIds, instance.result.referenceMap["button-instance"]]);
 });

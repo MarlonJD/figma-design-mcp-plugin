@@ -13,7 +13,9 @@ import {
   type HostKind,
   type ExportOptions,
   nodeTreeSpecSchema,
+  setPrototypeSpecSchema,
   type NodeTreeSpec,
+  type SetPrototypeSpec,
   type VisualContext,
   exportOptionsSchema,
   screenSpecSchema,
@@ -43,6 +45,11 @@ export interface DesignHostAdapter {
   updateSelection(payload: {
     patch: DesignPatch;
     targetIds: string[];
+    expectedSnapshotId: string;
+    documentId?: string;
+    sessionId?: string;
+  }): Promise<unknown>;
+  setPrototype(payload: SetPrototypeSpec & {
     expectedSnapshotId: string;
     documentId?: string;
     sessionId?: string;
@@ -140,5 +147,18 @@ export class BridgeHostAdapter implements DesignHostAdapter {
       sessionId: z.string().min(1).optional(),
     }).strict().parse(payload);
     return this.bridge.request(this.host, "update_selection", normalized);
+  }
+
+  async setPrototype(payload: SetPrototypeSpec & {
+    expectedSnapshotId: string;
+    documentId?: string;
+    sessionId?: string;
+  }): Promise<unknown> {
+    const normalized = setPrototypeSpecSchema.extend({
+      expectedSnapshotId: z.string().min(1),
+      documentId: z.string().min(1).optional(),
+      sessionId: z.string().min(1).optional(),
+    }).strict().parse(payload);
+    return this.bridge.request(this.host, "set_prototype", normalized);
   }
 }

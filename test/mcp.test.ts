@@ -42,7 +42,7 @@ function hello() {
     capabilities: {
       host: "figma",
       pluginVersion: "test",
-      operations: ["update_selection"],
+      operations: ["update_selection", "set_prototype"],
       supports: {
         documentRead: true,
         selectionRead: true,
@@ -50,6 +50,7 @@ function hello() {
         createComponent: true,
         createNodeTree: true,
         updateSelection: true,
+        setPrototype: true,
         userActionRequiredForWrite: false,
       },
     },
@@ -111,6 +112,89 @@ test("public MCP update maps bridge session selection to native capture identity
     assert.deepEqual(result.structuredContent, {
       status: "applied",
       nodes: [{ host: "figma", id: "node-1" }],
+    });
+  } finally {
+    await client.close().catch(() => {});
+    await server.close().catch(() => {});
+    socket.close();
+    await closed(socket);
+    await bridge.stop();
+  }
+});
+
+test("public MCP prototype authoring maps bridge selection to native capture identity", async () => {
+  const bridge = new DesignPortBridge({
+    host: "127.0.0.1",
+    port: 0,
+    requestTimeoutMs: 1000,
+    serverVersion: "test",
+    pairingToken: PAIRING_TOKEN,
+  });
+  const address = await bridge.start();
+  const socket = await connect(`ws://127.0.0.1:${address.port}`);
+  const server = createMcpServer(bridge);
+  const client = new Client({ name: "mcp-prototype-contract-test", version: "test" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+  try {
+    socket.send(JSON.stringify(hello()));
+    const ack = await nextMessage(socket);
+    assert.equal(ack.type, "hello_ack");
+    const bridgeSessionId = bridge.listHosts()[0]?.sessionId;
+    assert.ok(bridgeSessionId);
+
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+
+    const responsePromise = client.callTool({
+      name: "design.set_prototype",
+      arguments: {
+        host: "figma",
+        sessionId: bridgeSessionId,
+        captureSessionId: "native-capture-session",
+        documentId: "figma-document",
+        expectedSnapshotId: "snapshot-native",
+        links: [{
+          sourceNodeId: "source-node",
+          destinationNodeId: "destination-frame",
+          mode: "set",
+          trigger: "on_click",
+          transition: "instant",
+        }],
+        flowStartingPoints: [{ nodeId: "destination-frame", name: "Destination", mode: "set" }],
+      },
+    });
+    const outbound = await nextMessage(socket);
+    assert.equal(outbound.type, "request");
+    assert.equal(outbound.operation, "set_prototype");
+    assert.equal(outbound.payload.sessionId, "native-capture-session");
+    assert.notEqual(outbound.payload.sessionId, bridgeSessionId);
+    assert.equal(outbound.payload.expectedSnapshotId, "snapshot-native");
+    assert.equal(outbound.payload.links[0].sourceNodeId, "source-node");
+    assert.equal(outbound.payload.flowStartingPoints[0].nodeId, "destination-frame");
+
+    socket.send(JSON.stringify({
+      type: "response",
+      requestId: outbound.requestId,
+      ok: true,
+      result: {
+        status: "applied",
+        affectedNodeIds: ["source-node", "destination-frame"],
+        linksSet: 1,
+        linksCleared: 0,
+        flowsSet: 1,
+        flowsCleared: 0,
+      },
+    }));
+    const result = await responsePromise;
+    assert.equal(result.isError, undefined);
+    assert.deepEqual(result.structuredContent, {
+      status: "applied",
+      affectedNodeIds: ["source-node", "destination-frame"],
+      linksSet: 1,
+      linksCleared: 0,
+      flowsSet: 1,
+      flowsCleared: 0,
     });
   } finally {
     await client.close().catch(() => {});

@@ -51,6 +51,7 @@ function hello(
         createComponent: host === "figma",
         createNodeTree: host === "figma",
         updateSelection: true,
+        setPrototype: host === "figma",
         userActionRequiredForWrite: host === "xd",
       },
     },

@@ -74,10 +74,13 @@ integration.
 - Report connected hosts, capabilities, and recent host events.
 - Create screens and basic components through host adapters.
 - Create a bounded native Figma node tree with explicit local references,
-  nested children, editable text, solid styling, and horizontal/vertical
-  Auto Layout.
+  nested children, editable text, solid styling, local component instances,
+  and horizontal/vertical Auto Layout.
 - Apply a normalized patch to explicit node IDs from a captured scope,
   including text, typography, geometry, and supported Auto Layout fields.
+- Set or explicitly clear bounded same-page instant prototype links and named
+  Figma flow starting points; set destinations must be different top-level
+  frames from their source's containing frame.
 - Return properties and visual context together for agent review.
 - Compare implementation screenshots with a deterministic local PNG diff.
 - Keep the bridge on loopback (`127.0.0.1`) by default.
@@ -102,6 +105,7 @@ The available MCP tools are:
 | `design.create_component` | Create a basic component or symbol where supported. |
 | `design.create_node_tree` | Create a bounded native Figma node tree; unsupported on XD. |
 | `design.update_selection` | Apply a normalized patch to explicit IDs from the expected snapshot scope; selection is not required. Public `sessionId` selects the bridge connection and `captureSessionId` carries the native snapshot session. |
+| `design.set_prototype` | Set or explicitly clear bounded instant on-click links and named Figma flow starting points; XD rejects it as unsupported. |
 | `design.ping` | Check that a host can receive requests. |
 
 See [EXAMPLES.md](EXAMPLES.md) for ready-to-copy tool arguments and common
@@ -273,9 +277,9 @@ The bridge must be running before the plugin connects.
 The plugin uses a hidden UI iframe for the localhost WebSocket connection, so
 no permanent panel is expected. Ask the MCP client to call
 `design.list_hosts`; it should report a connected `figma` host. Figma reports
-`create_node_tree` and explicit text/layout updates as supported, with
-prototype authoring and reusable instance/variant authoring explicitly
-deferred.
+`create_node_tree`, local component instances, explicit text/layout updates,
+and bounded prototype authoring as supported. Variant systems, remote
+component import, and arbitrary interaction authoring remain out of scope.
 
 #### Adobe XD
 

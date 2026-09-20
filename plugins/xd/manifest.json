@@ -2,7 +2,7 @@
   "manifestVersion": 4,
   "id": "designport-xd-development",
   "name": "DesignPort XD",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "main": "main.js",
   "host": {
     "app": "XD",

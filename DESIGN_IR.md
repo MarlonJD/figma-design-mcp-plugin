@@ -44,13 +44,16 @@ when a normalized field exists.
 ## Bounded authoring
 
 Figma exposes `design.create_node_tree` for a small native authoring slice:
-frame, text, rectangle, and component nodes; explicit caller-local references;
-current-page roots; nested parent relationships; solid fills; essential strokes
-and corner radii; editable text and typography; and horizontal/vertical
-Auto Layout. The operation returns every created host ID and its reference map.
-It requires a complete `expectedSnapshotId`, is bounded to 256 nodes, depth 12,
-20,000 characters per text node, and a 2 MB JSON payload, and cleans up only
-task-created nodes if mutation fails.
+frame, text, rectangle, component, and local `instance` nodes; explicit
+caller-local references; current-page roots; nested parent relationships;
+solid fills; essential strokes and corner radii; editable text and typography;
+and horizontal/vertical Auto Layout. An instance references an existing local
+component in the same document and may set at most eight exposed text
+properties; remote imports and variants are not part of the contract. The
+operation returns every created host ID and its reference map, plus descendant
+IDs for created instances. It requires a complete `expectedSnapshotId`, is
+bounded to 256 nodes, depth 12, 20,000 characters per text node, and a 2 MB
+JSON payload, and cleans up only task-created nodes if mutation fails.
 
 `design.update_selection` is an explicit-ID update despite its historical tool
 name. `targetIds` must belong to the complete expected capture scope, but the
@@ -63,6 +66,16 @@ or typography. Font weight is expressed through the requested font style because
 Figma exposes the numeric weight as read-only.
 XD reports node-tree, typography, and Auto Layout authoring as unsupported; it
 does not substitute a plain group or claim a write succeeded.
+
+Figma also exposes `design.set_prototype` for a bounded native interaction
+slice. It sets or explicitly clears instant on-click navigation actions and
+named page flow starting points. Link sources must be in the complete capture
+scope; destinations must be top-level frames on the current page in the same
+document, and a set destination must differ from the source's containing
+top-level frame. Same-screen navigation self-links are rejected before any
+native setter. The public bridge selector and native capture session are
+separate, and stale snapshot, session, document, page, and target checks remain
+active.
 
 ## Layout interpretation
 

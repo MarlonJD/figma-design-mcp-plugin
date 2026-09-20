@@ -84,11 +84,11 @@ async function main() {
     host: "127.0.0.1",
     port: requestedPort,
     requestTimeoutMs: 30_000,
-    serverVersion: "0.5.0",
+    serverVersion: "0.6.0",
     pairingToken: PAIRING_TOKEN,
   });
   const address = await bridge.start();
-  const client = new Client({ name: "designport-avia-fixture", version: "0.5.0" });
+  const client = new Client({ name: "designport-avia-fixture", version: "0.6.0" });
   const server = createMcpServer(bridge);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -143,7 +143,7 @@ async function main() {
       expectedSnapshotId: initial.snapshot.id,
       nodes,
     });
-    if (created.createdNodeIds.length !== nodes.length) throw new Error("The host did not return every created node ID.");
+    if (created.createdNodeIds.length < nodes.length) throw new Error("The host did not return every authored node ID.");
     if (Object.keys(created.referenceMap).length !== nodes.length) throw new Error("The host did not return a complete caller-reference map.");
 
     const waitForDocumentRevision = async (previousRevision) => {
@@ -245,7 +245,7 @@ async function main() {
       checks: {
         screenCount: created.rootNodeIds.length,
         nodeCount: created.createdNodeIds.length,
-        createdIdsComplete: checkIds.size === nodes.length,
+        createdIdsComplete: nodes.every((node) => checkIds.has(created.referenceMap[node.ref])),
         parentRelationships: true,
         nestedNativeNodes: true,
         autoLayout: true,
@@ -264,8 +264,9 @@ async function main() {
         afterLayout: afterLayout.snapshot.id,
       },
       limitations: {
-        prototypeAuthoring: "deferred",
-        componentInstancesAndVariants: "deferred",
+        prototypeAuthoring: "not_exercised_by_static_three_screen_runner",
+        componentInstances: "bounded_local_instances_supported_by_create_node_tree",
+        variants: "deferred",
         evidence: "This runner checks exported native structure and IDs; it does not substitute screenshots or HTML.",
       },
     };

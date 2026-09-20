@@ -7,7 +7,7 @@ const { Artboard, Rectangle, Text, Color } = scenegraph;
 
 const BRIDGE_URL = "ws://127.0.0.1:5514";
 const BRIDGE_PROTOCOL_VERSION = 2;
-const PLUGIN_VERSION = "0.5.0";
+const PLUGIN_VERSION = "0.6.0";
 const PAIRING_TOKEN = "designport-local-pairing";
 const MAX_ASSET_EXPORTS_PER_REQUEST = 64;
 const MAX_PENDING_WRITES = 32;
@@ -35,6 +35,7 @@ const CAPABILITIES = {
   limitations: [
     "component-creation-unsupported",
     "node-tree-authoring-unsupported",
+    "prototype-authoring-unsupported",
     "auto-layout-authoring-unsupported",
     "typography-updates-unsupported",
     "component-state-coverage-depends-on-xd-uxp-surface",
@@ -59,6 +60,7 @@ const CAPABILITIES = {
     createComponent: false,
     createNodeTree: false,
     updateSelection: true,
+    setPrototype: false,
     userActionRequiredForWrite: true,
     visualRead: true,
   },
@@ -2317,6 +2319,11 @@ async function handleRequest(request) {
       case "create_node_tree": {
         const error = new Error("XD cannot author a bounded native node tree through the public UXP surface");
         error.code = "XD_NODE_TREE_AUTHORING_UNSUPPORTED";
+        throw error;
+      }
+      case "set_prototype": {
+        const error = new Error("XD cannot author bounded native prototype links through the public UXP surface");
+        error.code = "XD_PROTOTYPE_AUTHORING_UNSUPPORTED";
         throw error;
       }
       case "create_component": {

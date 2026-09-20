@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { BridgeHostAdapter } from "../src/core/adapter.js";
 import {
   nodeTreeSpecSchema,
+  setPrototypeSpecSchema,
   type NodeTreeSpec,
 } from "../src/core/ir.js";
 
@@ -71,6 +72,35 @@ test("node-tree schema bounds nesting, rejects unknown fields, and accepts expli
   assert.throws(() => nodeTreeSpecSchema.parse({
     nodes: [{ ref: "screen", kind: "frame", name: "Screen", text: "not allowed" }],
   }));
+  assert.doesNotThrow(() => nodeTreeSpecSchema.parse({
+    nodes: [{
+      ref: "button-instance",
+      kind: "instance",
+      name: "Button instance",
+      componentId: "local-component-id",
+      textOverrides: { "Label#0:0": "Open" },
+      width: 220,
+      height: 52,
+    }],
+  }));
+  assert.throws(() => nodeTreeSpecSchema.parse({
+    nodes: [{ ref: "missing-component", kind: "instance", name: "Missing component" }],
+  }));
+  assert.throws(() => nodeTreeSpecSchema.parse({
+    nodes: [{ ref: "wrong-fields", kind: "frame", name: "Frame", componentId: "not-allowed" }],
+  }));
+  assert.doesNotThrow(() => setPrototypeSpecSchema.parse({
+    links: [
+      { sourceNodeId: "source", destinationNodeId: "destination", mode: "set", trigger: "on_click", transition: "instant" },
+      { sourceNodeId: "source", destinationNodeId: "destination", mode: "clear", clearScope: "matching" },
+      { sourceNodeId: "source", mode: "clear", clearScope: "all" },
+    ],
+    flowStartingPoints: [{ nodeId: "destination", name: "Launch", mode: "set" }],
+  }));
+  assert.throws(() => setPrototypeSpecSchema.parse({
+    links: [{ sourceNodeId: "source", mode: "clear" }],
+    flowStartingPoints: [],
+  }));
 });
 
 test("adapter validates and routes node-tree creation and explicit-ID updates", async () => {
@@ -84,6 +114,16 @@ test("adapter validates and routes node-tree creation and explicit-ID updates", 
           createdNodeIds: ["1:1", "1:2"],
           rootNodeIds: ["1:1"],
           referenceMap: { screen: "1:1", "body-copy": "1:2" },
+        };
+      }
+      if (operation === "set_prototype") {
+        return {
+          status: "applied",
+          affectedNodeIds: ["source", "destination"],
+          linksSet: 1,
+          linksCleared: 0,
+          flowsSet: 1,
+          flowsCleared: 0,
         };
       }
       return { status: "applied", nodes: [{ host: "figma", id: "1:2" }] };
@@ -103,9 +143,22 @@ test("adapter validates and routes node-tree creation and explicit-ID updates", 
     documentId: "doc-1",
     sessionId: "session-1",
   });
+  await adapter.setPrototype({
+    expectedSnapshotId: "snapshot-4",
+    sessionId: "native-capture-session",
+    links: [{
+      sourceNodeId: "source",
+      destinationNodeId: "destination",
+      mode: "set",
+      trigger: "on_click",
+      transition: "instant",
+    }],
+    flowStartingPoints: [{ nodeId: "destination", name: "Destination", mode: "set" }],
+  });
 
   assert.equal(calls[0]?.operation, "create_node_tree");
   assert.equal(calls[1]?.operation, "update_selection");
+  assert.equal(calls[2]?.operation, "set_prototype");
   assert.deepEqual((calls[1]?.payload as { targetIds: string[] }).targetIds, ["1:2"]);
   await assert.rejects(() => adapter.updateSelection({
     expectedSnapshotId: "snapshot-3",

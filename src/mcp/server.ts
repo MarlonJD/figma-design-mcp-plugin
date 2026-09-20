@@ -7,6 +7,7 @@ import {
   screenSpecSchema,
   hostKindSchema,
   captureScopeSchema,
+  nodeTreeSpecSchema,
   type HostKind,
   visualContextSchema,
 } from "../core/ir.js";
@@ -36,9 +37,17 @@ const componentInput = componentSpecSchema.extend({
   expectedSnapshotId: z.string().min(1),
 }).strict();
 
+const nodeTreeInput = nodeTreeSpecSchema.extend({
+  host: hostKindSchema.optional(),
+  sessionId: z.string().min(1).optional(),
+  documentId: z.string().min(1).optional(),
+  expectedSnapshotId: z.string().min(1),
+}).strict();
+
 const updateSelectionInput = z.object({
   host: hostKindSchema.optional(),
   sessionId: z.string().min(1).optional(),
+  captureSessionId: z.string().min(1),
   documentId: z.string().min(1).optional(),
   patch: designPatchSchema,
   targetIds: z.array(z.string().min(1)).min(1).max(2000),
@@ -211,7 +220,7 @@ async function callBridge<T>(
 export function createMcpServer(bridge: DesignPortBridge): McpServer {
   const server = new McpServer({
     name: "designport",
-    version: "0.4.0",
+    version: "0.5.0",
   });
 
   server.registerTool(
@@ -473,19 +482,30 @@ export function createMcpServer(bridge: DesignPortBridge): McpServer {
   );
 
   server.registerTool(
+    "design.create_node_tree",
+    {
+      title: "Create a bounded native node tree",
+      description: "Create frames, text, rectangles, and components with explicit local references, nested parents, solid styling, and horizontal or vertical auto layout. Requires a complete expected snapshot and never uses the current selection.",
+      inputSchema: nodeTreeInput.shape,
+    },
+    async ({ host, sessionId, documentId, ...spec }) =>
+      callBridge(bridge, selectorFor(host, sessionId, documentId), "create_node_tree", spec),
+  );
+
+  server.registerTool(
     "design.update_selection",
     {
-      title: "Update the design selection",
-      description: "Apply a normalized patch to the current host selection.",
+      title: "Update explicit design nodes",
+      description: "Apply a normalized patch to explicit node IDs captured by the expected snapshot. sessionId selects the bridge connection; captureSessionId is the native session from snapshot.identity. Targets do not have to remain selected; the document, session, scope, and snapshot must still match.",
       inputSchema: updateSelectionInput.shape,
     },
-    async ({ host, sessionId, documentId, patch, targetIds, expectedSnapshotId }) =>
+    async ({ host, sessionId, captureSessionId, documentId, patch, targetIds, expectedSnapshotId }) =>
       callBridge(bridge, selectorFor(host, sessionId, documentId), "update_selection", {
         patch,
         targetIds,
         expectedSnapshotId,
         ...(documentId ? { documentId } : {}),
-        ...(sessionId ? { sessionId } : {}),
+        sessionId: captureSessionId,
       }),
   );
 

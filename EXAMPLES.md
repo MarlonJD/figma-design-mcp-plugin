@@ -319,14 +319,21 @@ must review them instead of treating them as final accessibility decisions.
 
 ## Host writes
 
-Writes are deliberately separate from reads. Create a screen in a scratch file
-while testing:
+Writes are deliberately separate from reads. First capture a complete document
+or page snapshot and retain its `snapshot.id`, `snapshot.identity.sessionId`,
+`documentId`, and the bridge `sessionId` returned by `design.list_hosts`. Pass
+the bridge selector and document/snapshot guards to every write; an explicit
+`design.update_selection` also passes the native capture session as
+`captureSessionId`. Create a screen in a scratch file while testing:
 
 ```json
 {
   "tool": "design.create_screen",
   "arguments": {
     "host": "figma",
+    "sessionId": "BRIDGE_SESSION_ID_FROM_design.list_hosts",
+    "documentId": "DOCUMENT_ID_FROM_CAPTURE",
+    "expectedSnapshotId": "SNAPSHOT_ID_FROM_CAPTURE",
     "name": "DesignPort Example",
     "width": 390,
     "height": 844,
@@ -335,24 +342,108 @@ while testing:
 }
 ```
 
-To apply a narrow change to the current selection:
+For a nested Figma wireframe, use one bounded native node-tree operation. Local
+references are caller-owned and the response returns every created host ID:
+
+```json
+{
+  "tool": "design.create_node_tree",
+  "arguments": {
+    "host": "figma",
+    "sessionId": "BRIDGE_SESSION_ID_FROM_design.list_hosts",
+    "documentId": "DOCUMENT_ID_FROM_CAPTURE",
+    "expectedSnapshotId": "SNAPSHOT_ID_FROM_CAPTURE",
+    "nodes": [
+      {
+        "ref": "screen",
+        "kind": "frame",
+        "name": "Example screen",
+        "width": 1440,
+        "height": 900,
+        "fill": { "r": 0.96, "g": 0.97, "b": 0.98, "a": 1 },
+        "layout": {
+          "mode": "vertical",
+          "gap": 16,
+          "padding": { "top": 24, "right": 24, "bottom": 24, "left": 24 },
+          "sizingHorizontal": "fixed",
+          "sizingVertical": "fixed"
+        }
+      },
+      {
+        "ref": "title",
+        "parentRef": "screen",
+        "kind": "text",
+        "name": "Title",
+        "text": "Editable title",
+        "typography": { "family": "Inter", "style": "Bold", "size": 24 },
+        "layout": { "sizingHorizontal": "fill", "sizingVertical": "hug" }
+      }
+    ]
+  }
+}
+```
+
+The operation is bounded to 256 nodes, depth 12, 20,000 characters per text
+node, and a 2 MB JSON payload. Roots are created on the current Figma page;
+children use `parentRef`. Auto-layout parents must be created before their
+children logically, although the host orders valid references before
+mutation. `fill` sizing is only valid for auto-layout children, and `hug` is
+only valid for text or auto-layout frame/component nodes.
+
+To apply a narrow change to explicit IDs from the captured scope:
 
 ```json
 {
   "tool": "design.update_selection",
   "arguments": {
     "host": "figma",
+    "sessionId": "BRIDGE_SESSION_ID_FROM_design.list_hosts",
+    "captureSessionId": "SNAPSHOT.identity.sessionId",
+    "documentId": "DOCUMENT_ID_FROM_CAPTURE",
+    "expectedSnapshotId": "SNAPSHOT_ID_FROM_CAPTURE",
+    "targetIds": ["TEXT_NODE_ID_FROM_CAPTURE"],
     "patch": {
-      "name": "Primary Button / Hover",
-      "opacity": 0.92,
-      "bounds": { "width": 176 }
+      "text": "Updated through DesignPort",
+      "typography": { "family": "Inter", "style": "Medium", "size": 17 }
     }
   }
 }
 ```
 
-Keep write operations explicit and narrow. Figma applies supported writes
-immediately; XD queues writes for the user-initiated Apply action in its panel.
+For `design.update_selection`, these two session fields are intentionally
+different: `sessionId` selects the live bridge connection returned by
+`design.list_hosts`, while `captureSessionId` is the native host session stored
+in the expected snapshot identity. The bridge maps the latter to the native
+write guard; do not omit either identity when targeting a specific host.
+
+The same explicit-ID operation can update supported `bounds`, solid `fills`,
+`stroke`, corner properties, and Auto Layout `layout` fields. It does not
+require the target to remain selected, but it rejects stale snapshots,
+cross-document IDs, and targets outside the captured scope. Figma applies
+supported writes immediately; XD queues supported writes for the user-initiated
+Apply action in its panel and explicitly rejects node-tree, typography, and
+Auto Layout authoring.
+
+## Reproduce the Avia wireframe fixture
+
+The checked-in fixture creates three 1440×900 desktop screens for the fictional
+Avia workflow: Department Manager risk profile, Planning draft, and Finance
+budget review. It checks native parent relationships, editable text, Auto
+Layout, returned IDs, and one explicit text update plus one explicit layout
+update. It never uses HTML or screenshots as structural proof.
+
+Run it with a dedicated bridge port; the runner starts its own ephemeral bridge
+and waits for a Figma host rather than attaching to a coordinator-owned 5514
+process:
+
+```bash
+npm run fixture:avia -- --host-timeout-ms 120000
+```
+
+Point the development plugin at the bridge URL printed by the runner before
+the timeout expires. The runner prints a machine-readable JSON result after
+the MCP calls complete. Reusable instances/variants and prototype links are
+documented as deferred for this static wireframe experiment.
 
 ## A practical agent prompt
 

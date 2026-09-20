@@ -9,6 +9,7 @@ import {
   exportOptionsSchema,
   hostCapabilitiesSchema,
   hostKindSchema,
+  nodeTreeSpecSchema,
   screenSpecSchema,
   visualContextSchema,
 } from "./ir.js";
@@ -47,6 +48,7 @@ const writeStateSchema = z.object({
 
 const createScreenInputSchema = screenSpecSchema.extend(writeStateSchema.shape).strict();
 const createComponentInputSchema = componentSpecSchema.extend(writeStateSchema.shape).strict();
+const createNodeTreeInputSchema = nodeTreeSpecSchema.extend(writeStateSchema.shape).strict();
 const updateSelectionInputSchema = z.object({
   patch: designPatchSchema,
   targetIds: z.array(z.string().min(1)).min(1).max(2000),
@@ -77,8 +79,18 @@ const writeOutputSchema = z.object({
   pendingCount: z.number().int().nonnegative().optional(),
   node: z.unknown().optional(),
   nodes: z.array(z.unknown()).optional(),
+  createdNodeIds: z.array(z.string().min(1)).optional(),
+  rootNodeIds: z.array(z.string().min(1)).optional(),
+  referenceMap: z.record(z.string(), z.string()).optional(),
   kind: z.string().min(1).optional(),
   message: z.string().min(1).optional(),
+}).strict();
+
+const nodeTreeOutputSchema = writeOutputSchema.extend({
+  status: z.literal("applied"),
+  createdNodeIds: z.array(z.string().min(1)).min(1),
+  rootNodeIds: z.array(z.string().min(1)).min(1),
+  referenceMap: z.record(z.string(), z.string()).refine((value) => Object.keys(value).length > 0),
 }).strict();
 
 const assetOutputSchema = designAssetSchema.extend({
@@ -162,6 +174,12 @@ export const operationRegistry = {
     capability: "create_component",
     input: createComponentInputSchema,
     output: writeOutputSchema,
+  },
+  create_node_tree: {
+    access: "write",
+    capability: "create_node_tree",
+    input: createNodeTreeInputSchema,
+    output: nodeTreeOutputSchema,
   },
   update_selection: {
     access: "write",

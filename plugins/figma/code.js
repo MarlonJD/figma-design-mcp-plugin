@@ -1,5 +1,5 @@
 const BRIDGE_PROTOCOL_VERSION = 2;
-const PLUGIN_VERSION = "0.4.0";
+const PLUGIN_VERSION = "0.5.0";
 const PAIRING_TOKEN = "designport-local-pairing";
 
 const CAPABILITIES = {
@@ -21,6 +21,16 @@ const CAPABILITIES = {
     "incremental-snapshots",
     "bounded-asset-retrieval",
     "capture-consistency",
+    "node-tree-authoring",
+    "explicit-node-updates",
+    "font-aware-text-updates",
+    "auto-layout-authoring",
+  ],
+  limitations: [
+    "solid-fill-authoring-only",
+    "prototype-authoring-deferred",
+    "component-instance-and-variant-authoring-deferred",
+    "font-weight-is-set-through-font-style",
   ],
   operations: [
     "ping",
@@ -33,6 +43,7 @@ const CAPABILITIES = {
     "get_operation_status",
     "create_screen",
     "create_component",
+    "create_node_tree",
     "update_selection",
   ],
   supports: {
@@ -40,6 +51,7 @@ const CAPABILITIES = {
     selectionRead: true,
     createScreen: true,
     createComponent: true,
+    createNodeTree: true,
     updateSelection: true,
     userActionRequiredForWrite: false,
     visualRead: true,
@@ -2146,40 +2158,445 @@ function paintFromColor(color) {
   };
 }
 
-function applyPatch(node, patch) {
+function writeError(code, message, details) {
+  const error = new Error(message);
+  error.code = code;
+  if (details !== undefined) error.details = details;
+  return error;
+}
+
+function isContainerNode(node) {
+  return Boolean(node && ["PAGE", "FRAME", "COMPONENT", "COMPONENT_SET", "INSTANCE", "GROUP"].includes(node.type));
+}
+
+function layoutModeValue(value) {
+  if (value === "horizontal") return "HORIZONTAL";
+  if (value === "vertical") return "VERTICAL";
+  if (value === "none") return "NONE";
+  return undefined;
+}
+
+function layoutSizingValue(value) {
+  if (value === "fixed") return "FIXED";
+  if (value === "hug") return "HUG";
+  if (value === "fill") return "FILL";
+  return undefined;
+}
+
+function assertNodeTreeSpec(spec) {
+  if (!spec || !Array.isArray(spec.nodes) || spec.nodes.length < 1 || spec.nodes.length > 256) {
+    throw writeError("AUTHORING_INVALID", "Node-tree authoring requires between 1 and 256 nodes.");
+  }
+  if (JSON.stringify(spec).length > 2_000_000) {
+    throw writeError("AUTHORING_PAYLOAD_TOO_LARGE", "Node-tree authoring payload exceeds the 2 MB limit.");
+  }
+  const byRef = new Map();
+  if (spec.nodes.filter((node) => node && !node.parentRef).length > 32) {
+    throw writeError("AUTHORING_INVALID", "A node-tree request may contain at most 32 roots.");
+  }
+  spec.nodes.forEach((node) => {
+    if (!node || typeof node.ref !== "string" || !/^[A-Za-z][A-Za-z0-9_.-]{0,79}$/.test(node.ref)) {
+      throw writeError("AUTHORING_INVALID", "Every authored node needs a valid local reference.");
+    }
+    if (byRef.has(node.ref)) throw writeError("AUTHORING_INVALID", `Duplicate node reference: ${node.ref}.`);
+    byRef.set(node.ref, node);
+  });
+
+  const depthFor = (node, path, depth) => {
+    if (depth > 12) throw writeError("AUTHORING_INVALID", "Node-tree depth may not exceed 12.");
+    if (!node.parentRef) return;
+    const parent = byRef.get(node.parentRef);
+    if (!parent) throw writeError("AUTHORING_INVALID", `Unknown parent reference: ${node.parentRef}.`);
+    if (path.includes(parent.ref)) throw writeError("AUTHORING_INVALID", "Node-tree parent relationships may not contain cycles.");
+    depthFor(parent, [...path, parent.ref], depth + 1);
+  };
+
+  spec.nodes.forEach((node) => {
+    const parent = node.parentRef ? byRef.get(node.parentRef) : undefined;
+    if (node.parentRef && !parent) throw writeError("AUTHORING_INVALID", `Unknown parent reference: ${node.parentRef}.`);
+    if (parent && !["frame", "component"].includes(parent.kind)) {
+      throw writeError("AUTHORING_INVALID", `Node ${node.ref} cannot be nested under ${parent.kind}.`);
+    }
+    depthFor(node, [node.ref], 1);
+    const layout = { ...(node.layout || {}), mode: node.layout && node.layout.mode || "none" };
+    const parentMode = parent && parent.layout && parent.layout.mode && parent.layout.mode !== "none"
+      ? parent.layout.mode
+      : undefined;
+    const hasSizing = Boolean(layout.sizingHorizontal || layout.sizingVertical);
+    if (layout.mode !== "none" && !["frame", "component"].includes(node.kind)) {
+      throw writeError("AUTHORING_INVALID", `Only frame and component nodes may own auto layout (${node.ref}).`);
+    }
+    if (layout.mode === "none" && (layout.gap !== undefined || layout.padding || layout.primaryAxisAlign
+      || layout.counterAxisAlign || layout.wrap || layout.counterAxisSpacing !== undefined)) {
+      throw writeError("AUTHORING_INVALID", `Node ${node.ref} has flow properties without auto layout.`);
+    }
+    if (hasSizing && !parentMode && node.kind === "rectangle") {
+      throw writeError("AUTHORING_INVALID", `Rectangle ${node.ref} needs an auto-layout parent for sizing.`);
+    }
+    if (hasSizing && !parentMode && node.kind === "frame" && layout.mode === "none") {
+      throw writeError("AUTHORING_INVALID", `Frame ${node.ref} needs auto layout for its sizing.`);
+    }
+    if ((layout.sizingHorizontal === "fill" || layout.sizingVertical === "fill") && !parentMode) {
+      throw writeError("AUTHORING_INVALID", `Fill sizing requires an auto-layout parent (${node.ref}).`);
+    }
+    if ((layout.sizingHorizontal === "hug" || layout.sizingVertical === "hug")
+      && node.kind !== "text" && layout.mode === "none") {
+      throw writeError("AUTHORING_INVALID", `Hug sizing requires an auto-layout frame/component (${node.ref}).`);
+    }
+    if (parentMode && node.positioning !== "absolute" && (node.x !== undefined || node.y !== undefined)) {
+      throw writeError("AUTHORING_INVALID", `Flow child ${node.ref} cannot set x/y without absolute positioning.`);
+    }
+    if (node.kind === "text" && typeof node.text !== "string") {
+      throw writeError("AUTHORING_INVALID", `Text node ${node.ref} requires text.`);
+    }
+    if (node.kind !== "text" && (node.text !== undefined || node.typography !== undefined)) {
+      throw writeError("AUTHORING_INVALID", `Only text nodes may set text or typography (${node.ref}).`);
+    }
+    if (node.positioning === "absolute" && !parentMode) {
+      throw writeError("AUTHORING_INVALID", `Absolute positioning requires an auto-layout parent (${node.ref}).`);
+    }
+  });
+}
+
+function applyPaintAndGeometry(node, spec) {
+  if (spec.fill !== undefined && "fills" in node) node.fills = [paintFromColor(spec.fill)];
+  if (spec.stroke !== undefined && "strokes" in node) {
+    node.strokes = [paintFromColor(spec.stroke.color)];
+    node.strokeWeight = spec.stroke.weight;
+    node.strokeAlign = spec.stroke.position === "center" ? "CENTER" : spec.stroke.position === "outside" ? "OUTSIDE" : "INSIDE";
+  }
+  if (spec.cornerRadius !== undefined) {
+    if (!("cornerRadius" in node)) throw writeError("UNSUPPORTED_AUTHORING", `Node ${node.type} does not support cornerRadius.`);
+    node.cornerRadius = spec.cornerRadius;
+  }
+  if (spec.cornerRadii !== undefined) {
+    if (!("topLeftRadius" in node)) throw writeError("UNSUPPORTED_AUTHORING", `Node ${node.type} does not support individual corner radii.`);
+    node.topLeftRadius = spec.cornerRadii.topLeft;
+    node.topRightRadius = spec.cornerRadii.topRight;
+    node.bottomRightRadius = spec.cornerRadii.bottomRight;
+    node.bottomLeftRadius = spec.cornerRadii.bottomLeft;
+  }
+  if (Number.isFinite(spec.opacity)) node.opacity = clamp(spec.opacity, 0, 1);
+  if (typeof spec.visible === "boolean") node.visible = spec.visible;
+  if (typeof spec.clipsContent === "boolean" && "clipsContent" in node) node.clipsContent = spec.clipsContent;
+}
+
+function fontKey(font) {
+  if (!font || typeof font !== "object" || typeof font.family !== "string" || typeof font.style !== "string") return "";
+  return `${font.family}\u0000${font.style}\u0000${JSON.stringify(font.variationSettings || {})}`;
+}
+
+function fontFromNode(node) {
+  if (node && node.fontName && typeof node.fontName === "object" && typeof node.fontName.family === "string" && typeof node.fontName.style === "string") {
+    return { family: node.fontName.family, style: node.fontName.style };
+  }
+  return { family: "Inter", style: "Regular" };
+}
+
+async function loadFontsForText(node, typography) {
+  if (node.hasMissingFont === true) throw writeError("FONT_MISSING", `Text node ${node.id} has a missing font.`);
+  const fonts = new Map();
+  const add = (font) => {
+    const key = fontKey(font);
+    if (key) fonts.set(key, font);
+  };
+  if (typeof node.getRangeAllFontNames === "function" && typeof node.characters === "string" && node.characters.length > 0) {
+    const existing = node.getRangeAllFontNames(0, node.characters.length);
+    if (Array.isArray(existing)) existing.forEach(add);
+  }
+  add(fontFromNode(node));
+  if (typography && (typography.family || typography.style)) {
+    add({
+      family: typography.family || fontFromNode(node).family,
+      style: typography.style || fontFromNode(node).style,
+    });
+  }
+  await Promise.all([...fonts.values()].map((font) => figma.loadFontAsync(font)));
+}
+
+function typographyFont(node, typography) {
+  const current = fontFromNode(node);
+  return {
+    family: typography.family || current.family,
+    style: typography.style || current.style,
+  };
+}
+
+async function applyTypography(node, text, typography) {
+  if (text === undefined && typography === undefined) return;
+  if (!node || node.type !== "TEXT") throw writeError("TEXT_TARGET_REQUIRED", "Text and typography updates require a text node.");
+  if (typography && typography.weight !== undefined) {
+    throw writeError("UNSUPPORTED_TYPOGRAPHY_FIELD", "Figma font weight is read-only; provide the font family and style instead.");
+  }
+  await loadFontsForText(node, typography || {});
+  if (typography && (typography.family || typography.style)) node.fontName = typographyFont(node, typography);
+  if (text !== undefined) {
+    if (typeof node.autoRename === "boolean") node.autoRename = false;
+    node.characters = text;
+  }
+  if (!typography) return;
+  if (typography.size !== undefined) node.fontSize = typography.size;
+  if (typography.lineHeight !== undefined) node.lineHeight = { unit: "PIXELS", value: typography.lineHeight };
+  if (typography.letterSpacing !== undefined) node.letterSpacing = { unit: "PIXELS", value: typography.letterSpacing };
+  if (typography.align !== undefined) node.textAlignHorizontal = typography.align === "center"
+    ? "CENTER" : typography.align === "right" ? "RIGHT" : typography.align === "justified" ? "JUSTIFIED" : "LEFT";
+  if (typography.alignVertical !== undefined) node.textAlignVertical = typography.alignVertical === "center"
+    ? "CENTER" : typography.alignVertical === "bottom" ? "BOTTOM" : "TOP";
+  if (typography.decoration !== undefined) node.textDecoration = typography.decoration === "underline"
+    ? "UNDERLINE" : typography.decoration === "strikethrough" ? "STRIKETHROUGH" : "NONE";
+  if (typography.textCase !== undefined) node.textCase = {
+    original: "ORIGINAL",
+    upper: "UPPER",
+    lower: "LOWER",
+    title: "TITLE",
+    "small-caps": "SMALL_CAPS",
+    "small-caps-forced": "SMALL_CAPS_FORCED",
+  }[typography.textCase];
+  if (typography.paragraphIndent !== undefined) node.paragraphIndent = typography.paragraphIndent;
+  if (typography.paragraphSpacing !== undefined) node.paragraphSpacing = typography.paragraphSpacing;
+  if (typography.textTruncation !== undefined) node.textTruncation = typography.textTruncation === "ending" ? "ENDING" : "DISABLED";
+  if (typography.maxLines !== undefined) node.maxLines = typography.maxLines;
+}
+
+function applyLayoutMode(node, layout) {
+  if (!layout || layout.mode === undefined) return;
+  const mode = layoutModeValue(layout.mode);
+  if (!mode) throw writeError("AUTHORING_INVALID", `Unsupported auto-layout mode: ${layout.mode}.`);
+  if (mode !== "NONE" && !isContainerNode(node)) throw writeError("LAYOUT_TARGET_REQUIRED", "Only frame-like nodes can own auto layout.");
+  if (mode === "NONE" && !isContainerNode(node)) return;
+  node.layoutMode = mode;
+}
+
+function applyLayoutProperties(node, layout) {
+  if (!layout) return;
+  const mode = node.layoutMode;
+  const hasFlowProperties = layout.gap !== undefined || layout.padding || layout.primaryAxisAlign
+    || layout.counterAxisAlign || layout.wrap || layout.counterAxisSpacing !== undefined;
+  if (hasFlowProperties && mode !== "HORIZONTAL" && mode !== "VERTICAL") {
+    throw writeError("AUTHORING_INVALID", "Gap, padding, and alignment require horizontal or vertical auto layout.");
+  }
+  if (layout.gap !== undefined) node.itemSpacing = layout.gap;
+  if (layout.padding) {
+    node.paddingTop = layout.padding.top;
+    node.paddingRight = layout.padding.right;
+    node.paddingBottom = layout.padding.bottom;
+    node.paddingLeft = layout.padding.left;
+  }
+  if (layout.primaryAxisAlign !== undefined) node.primaryAxisAlignItems = layout.primaryAxisAlign === "center"
+    ? "CENTER" : layout.primaryAxisAlign === "max" ? "MAX" : layout.primaryAxisAlign === "space-between" ? "SPACE_BETWEEN" : "MIN";
+  if (layout.counterAxisAlign !== undefined) node.counterAxisAlignItems = layout.counterAxisAlign === "center"
+    ? "CENTER" : layout.counterAxisAlign === "max" ? "MAX" : layout.counterAxisAlign === "baseline" ? "BASELINE" : "MIN";
+  if (layout.wrap !== undefined) node.layoutWrap = layout.wrap === "wrap" ? "WRAP" : "NO_WRAP";
+  if (layout.counterAxisSpacing !== undefined) node.counterAxisSpacing = layout.counterAxisSpacing;
+  const parentMode = node.parent && node.parent.layoutMode;
+  const applySizing = (property, value) => {
+    if (value === undefined) return;
+    const sizing = layoutSizingValue(value);
+    if (!sizing) throw writeError("AUTHORING_INVALID", `Unsupported sizing value: ${value}.`);
+    if (sizing === "FILL" && parentMode !== "HORIZONTAL" && parentMode !== "VERTICAL") {
+      throw writeError("AUTHORING_INVALID", "Fill sizing requires an auto-layout parent.");
+    }
+    if (sizing === "HUG" && node.type !== "TEXT" && node.layoutMode === "NONE") {
+      throw writeError("AUTHORING_INVALID", "Hug sizing requires a text node or auto-layout frame.");
+    }
+    node[property] = sizing;
+  };
+  // Figma only accepts these setters after the parent layout mode exists.
+  applySizing("layoutSizingHorizontal", layout.sizingHorizontal);
+  applySizing("layoutSizingVertical", layout.sizingVertical);
+}
+
+function applyBounds(node, bounds, coordinateSpace, positioning) {
+  if (!bounds) return;
+  const parentMode = node.parent && node.parent.layoutMode;
+  if ((Number.isFinite(bounds.x) || Number.isFinite(bounds.y))
+    && (parentMode === "HORIZONTAL" || parentMode === "VERTICAL")
+    && positioning !== "absolute"
+    && node.layoutPositioning !== "ABSOLUTE") {
+    throw writeError("AUTHORING_INVALID", "Flow children cannot set x/y without absolute positioning.");
+  }
+  const width = Number.isFinite(bounds.width) ? bounds.width : node.width;
+  const height = Number.isFinite(bounds.height) ? bounds.height : node.height;
+  if ((Number.isFinite(bounds.width) || Number.isFinite(bounds.height)) && typeof node.resize === "function") {
+    if (!(width > 0) || !(height > 0)) throw writeError("AUTHORING_INVALID", "Node dimensions must be positive.");
+    node.resize(width, height);
+  }
+  if (Number.isFinite(bounds.x) || Number.isFinite(bounds.y)) {
+    if (coordinateSpace === "world" && node.parent && node.parent.absoluteBoundingBox) {
+      if (Number.isFinite(bounds.x)) node.x = bounds.x - node.parent.absoluteBoundingBox.x;
+      if (Number.isFinite(bounds.y)) node.y = bounds.y - node.parent.absoluteBoundingBox.y;
+    } else {
+      if (Number.isFinite(bounds.x)) node.x = bounds.x;
+      if (Number.isFinite(bounds.y)) node.y = bounds.y;
+    }
+  }
+}
+
+function validatePatchForNode(node, patch) {
   const unsupported = Object.keys(patch || {}).filter((key) => ![
-    "coordinateSpace", "name", "bounds", "visible", "opacity", "fills",
+    "coordinateSpace", "name", "bounds", "visible", "opacity", "fills", "text", "typography",
+    "layout", "parentId", "stroke", "cornerRadius", "cornerRadii",
   ].includes(key));
-  if (unsupported.length) {
-    const error = new Error(`Figma does not support these patch fields: ${unsupported.join(", ")}`);
-    error.code = "UNSUPPORTED_PATCH_FIELD";
-    throw error;
-  }
+  if (unsupported.length) throw writeError("UNSUPPORTED_PATCH_FIELD", `Figma does not support these patch fields: ${unsupported.join(", ")}`);
   if (Array.isArray(patch.fills) && patch.fills.some((fill) => fill.type !== "solid" || !fill.color)) {
-    const error = new Error("Figma writes currently support solid fills only");
-    error.code = "UNSUPPORTED_PATCH_FIELD";
-    throw error;
+    throw writeError("UNSUPPORTED_PATCH_FIELD", "Figma writes currently support solid fills only.");
   }
+  if (patch.text !== undefined || patch.typography !== undefined) {
+    if (!node || node.type !== "TEXT") throw writeError("TEXT_TARGET_REQUIRED", "Text and typography updates require a text node.");
+    if (patch.typography && patch.typography.weight !== undefined) {
+      throw writeError("UNSUPPORTED_TYPOGRAPHY_FIELD", "Figma font weight is read-only; provide the font family and style instead.");
+    }
+  }
+  if (patch.layout) {
+    const layout = patch.layout;
+    const mode = layout.mode === undefined ? node.layoutMode : layout.mode;
+    if (layout.mode !== undefined && layout.mode !== "none" && !isContainerNode(node)) {
+      throw writeError("LAYOUT_TARGET_REQUIRED", "Only frame-like nodes can own auto layout.");
+    }
+    if (layout.mode === "none" && (layout.gap !== undefined || layout.padding || layout.primaryAxisAlign
+      || layout.counterAxisAlign || layout.wrap || layout.counterAxisSpacing !== undefined)) {
+      throw writeError("AUTHORING_INVALID", "Gap, padding, and alignment require horizontal or vertical auto layout.");
+    }
+    const hasSizing = Boolean(layout.sizingHorizontal || layout.sizingVertical);
+    if (hasSizing && mode === "none" && node.type !== "TEXT"
+      && (!node.parent || !["HORIZONTAL", "VERTICAL"].includes(node.parent.layoutMode))) {
+      throw writeError("AUTHORING_INVALID", "Frame sizing requires auto layout or an auto-layout parent.");
+    }
+    if ((layout.sizingHorizontal === "fill" || layout.sizingVertical === "fill")
+      && (!node.parent || !["HORIZONTAL", "VERTICAL"].includes(node.parent.layoutMode))) {
+      throw writeError("AUTHORING_INVALID", "Fill sizing requires an auto-layout parent.");
+    }
+    if ((layout.sizingHorizontal === "hug" || layout.sizingVertical === "hug")
+      && node.type !== "TEXT" && mode === "none") {
+      throw writeError("AUTHORING_INVALID", "Hug sizing requires a text node or auto-layout frame.");
+    }
+  }
+  if (patch.cornerRadius !== undefined && patch.cornerRadii !== undefined) {
+    throw writeError("AUTHORING_INVALID", "Use cornerRadius or cornerRadii, not both.");
+  }
+  if (patch.bounds && (Number.isFinite(patch.bounds.width) && patch.bounds.width <= 0
+    || Number.isFinite(patch.bounds.height) && patch.bounds.height <= 0)) {
+    throw writeError("AUTHORING_INVALID", "Updated node dimensions must be positive.");
+  }
+}
+
+async function applyPatch(node, patch) {
+  validatePatchForNode(node, patch);
+  await applyTypography(node, patch.text, patch.typography);
   if (patch.name) node.name = patch.name;
   if (typeof patch.visible === "boolean") node.visible = patch.visible;
   if (Number.isFinite(patch.opacity)) node.opacity = clamp(patch.opacity, 0, 1);
-  if (patch.bounds) {
-    const width = Number.isFinite(patch.bounds.width) ? patch.bounds.width : node.width;
-    const height = Number.isFinite(patch.bounds.height) ? patch.bounds.height : node.height;
-    if (typeof node.resize === "function") node.resize(width, height);
-    if (Number.isFinite(patch.bounds.x) || Number.isFinite(patch.bounds.y)) {
-      if (patch.coordinateSpace === "world" && node.parent && node.parent.absoluteBoundingBox) {
-        if (Number.isFinite(patch.bounds.x)) node.x = patch.bounds.x - node.parent.absoluteBoundingBox.x;
-        if (Number.isFinite(patch.bounds.y)) node.y = patch.bounds.y - node.parent.absoluteBoundingBox.y;
-      } else {
-        if (Number.isFinite(patch.bounds.x)) node.x = patch.bounds.x;
-        if (Number.isFinite(patch.bounds.y)) node.y = patch.bounds.y;
-      }
+  if (patch.bounds) applyBounds(node, patch.bounds, patch.coordinateSpace, node.layoutPositioning === "ABSOLUTE" ? "absolute" : undefined);
+  if (Array.isArray(patch.fills) && "fills" in node) {
+    node.fills = patch.fills.map((fill) => paintFromColor(fill.color));
+  }
+  if (patch.stroke !== undefined) applyPaintAndGeometry(node, patch);
+  if (patch.cornerRadius !== undefined || patch.cornerRadii !== undefined) applyPaintAndGeometry(node, patch);
+  if (patch.layout) {
+    applyLayoutMode(node, patch.layout);
+    applyLayoutProperties(node, patch.layout);
+    if (node.type === "TEXT" && patch.typography && patch.typography.autoResize !== undefined) {
+      node.textAutoResize = patch.typography.autoResize === "width-and-height"
+        ? "WIDTH_AND_HEIGHT" : patch.typography.autoResize === "height" ? "HEIGHT" : patch.typography.autoResize === "truncate" ? "TRUNCATE" : "NONE";
     }
   }
-  if (Array.isArray(patch.fills) && patch.fills.length && "fills" in node) {
-    node.fills = patch.fills.map((fill) => fill.color ? paintFromColor(fill.color) : { type: "SOLID", color: { r: 0, g: 0, b: 0 } });
+  if (node.type === "TEXT" && patch.typography && patch.typography.autoResize !== undefined) {
+    node.textAutoResize = patch.typography.autoResize === "width-and-height"
+      ? "WIDTH_AND_HEIGHT" : patch.typography.autoResize === "height" ? "HEIGHT" : patch.typography.autoResize === "truncate" ? "TRUNCATE" : "NONE";
   }
+}
+
+async function createAuthoredNode(spec, created) {
+  let node;
+  if (spec.kind === "frame") node = figma.createFrame();
+  else if (spec.kind === "rectangle") node = figma.createRectangle();
+  else if (spec.kind === "component") node = figma.createComponent();
+  else if (spec.kind === "text") node = figma.createText();
+  else throw writeError("AUTHORING_INVALID", `Unsupported authored node kind: ${spec.kind}.`);
+  created.push(node);
+
+  if (spec.kind === "text") {
+    await applyTypography(node, spec.text, spec.typography);
+    if (spec.typography && spec.typography.autoResize !== undefined) {
+      node.textAutoResize = spec.typography.autoResize === "width-and-height"
+        ? "WIDTH_AND_HEIGHT" : spec.typography.autoResize === "height" ? "HEIGHT" : spec.typography.autoResize === "truncate" ? "TRUNCATE" : "NONE";
+    }
+  }
+  applyLayoutMode(node, spec.layout);
+  if (Number.isFinite(spec.width) || Number.isFinite(spec.height)) {
+    const width = Number.isFinite(spec.width) ? spec.width : node.width || 100;
+    const height = Number.isFinite(spec.height) ? spec.height : node.height || 100;
+    if (typeof node.resize === "function") node.resize(width, height);
+  }
+  applyPaintAndGeometry(node, spec);
+  return node;
+}
+
+async function createNodeTree(spec) {
+  assertNodeTreeSpec(spec);
+  const orderedNodes = [];
+  const pending = new Set(spec.nodes.map((node) => node.ref));
+  while (pending.size > 0) {
+    let progressed = false;
+    for (const specNode of spec.nodes) {
+      if (!pending.has(specNode.ref)) continue;
+      if (specNode.parentRef && pending.has(specNode.parentRef)) continue;
+      orderedNodes.push(specNode);
+      pending.delete(specNode.ref);
+      progressed = true;
+    }
+    if (!progressed) throw writeError("AUTHORING_INVALID", "Node-tree parent relationships could not be ordered.");
+  }
+  const created = [];
+  const createdByRef = new Map();
+  try {
+    for (const specNode of orderedNodes) {
+      if (specNode.parentRef && !createdByRef.has(specNode.parentRef)) {
+        throw writeError("AUTHORING_INVALID", `Parent ${specNode.parentRef} must be created before child ${specNode.ref}.`);
+      }
+      const node = await createAuthoredNode(specNode, created);
+      createdByRef.set(specNode.ref, node);
+      if (specNode.parentRef) {
+        const parent = createdByRef.get(specNode.parentRef);
+        if (!parent || !isContainerNode(parent)) throw writeError("AUTHORING_INVALID", `Parent ${specNode.parentRef} cannot contain children.`);
+        parent.appendChild(node);
+      }
+      if (specNode.positioning === "absolute") node.layoutPositioning = "ABSOLUTE";
+      applyLayoutProperties(node, specNode.layout);
+      applyBounds(node, {
+        ...(Number.isFinite(specNode.x) ? { x: specNode.x } : {}),
+        ...(Number.isFinite(specNode.y) ? { y: specNode.y } : {}),
+        ...(Number.isFinite(specNode.width) ? { width: specNode.width } : {}),
+        ...(Number.isFinite(specNode.height) ? { height: specNode.height } : {}),
+      }, "parent", specNode.positioning);
+      // Set the requested name after text content so Figma cannot auto-rename it.
+      node.name = specNode.name;
+    }
+  } catch (error) {
+    for (let index = created.length - 1; index >= 0; index -= 1) {
+      try {
+        if (created[index] && typeof created[index].remove === "function" && !created[index].removed) created[index].remove();
+      } catch (_cleanupError) {
+        // Cleanup is best effort and is restricted to nodes created by this task.
+      }
+    }
+    throw error;
+  }
+  const referenceMap = Object.fromEntries(spec.nodes.map((item) => [item.ref, createdByRef.get(item.ref).id]));
+  const createdNodeIds = spec.nodes.map((item) => createdByRef.get(item.ref).id);
+  const rootNodeIds = spec.nodes.filter((item) => !item.parentRef).map((item) => createdByRef.get(item.ref).id);
+  return {
+    status: "applied",
+    createdNodeIds,
+    rootNodeIds,
+    referenceMap,
+    nodes: spec.nodes.map((item) => ({
+      reference: item.ref,
+      node: ref(createdByRef.get(item.ref).id),
+      ...(item.parentRef ? { parentReference: item.parentRef } : {}),
+    })),
+    kind: "node-tree",
+  };
 }
 
 async function createComponent(spec) {
@@ -2227,34 +2644,29 @@ function validateWriteState(payload, operation) {
     error.code = "WRITE_SESSION_MISMATCH";
     throw error;
   }
+  const expectedPageId = baseline.snapshot.identity.pageId;
   if (baseline.snapshot.identity.documentId !== info.documentId
     || baseline.snapshot.documentRevision !== snapshotState.documentRevision
-    || baseline.snapshot.selectionRevision !== snapshotState.selectionRevision) {
+    || expectedPageId && expectedPageId !== figma.currentPage.id) {
     const error = new Error("The expected capture is stale; read a fresh capture before writing");
     error.code = "WRITE_STALE_CAPTURE";
     throw error;
   }
   if (operation === "update_selection") {
     const targetIds = Array.isArray(payload.targetIds) ? payload.targetIds : [];
-    const expectedSelectionIds = baseline.snapshot.identity.selectedIds;
-    if (!targetIds.length || !targetIds.every((id) => expectedSelectionIds.includes(id))) {
-      const error = new Error("Write targets are not members of the expected selection capture");
-      error.code = "WRITE_TARGET_MISMATCH";
-      throw error;
+    const capturedIds = new Set((baseline.nodes || []).map((node) => node.id));
+    if (!targetIds.length || new Set(targetIds).size !== targetIds.length || !targetIds.every((id) => capturedIds.has(id))) {
+      throw writeError("WRITE_TARGET_MISMATCH", "Write targets must be explicit nodes in the expected capture scope.");
     }
-    const currentSelectionIds = selectionItems().map((item) => item.id);
-    if (currentSelectionIds.length !== expectedSelectionIds.length
-      || currentSelectionIds.some((id, index) => id !== expectedSelectionIds[index])) {
-      const error = new Error("The Figma selection changed after the expected capture");
-      error.code = "WRITE_SELECTION_CHANGED";
-      throw error;
+    if (payload.patch && payload.patch.parentId && !capturedIds.has(payload.patch.parentId)) {
+      throw writeError("WRITE_TARGET_MISMATCH", "A reparent target must be in the expected capture scope.");
     }
   }
   return baseline;
 }
 
 async function executeWrite(operation, payload) {
-  validateWriteState(payload || {}, operation);
+  const baseline = validateWriteState(payload || {}, operation);
   if (operation === "create_screen") {
     const spec = payload || {};
     const frame = figma.createFrame();
@@ -2267,16 +2679,31 @@ async function executeWrite(operation, payload) {
     return { status: "applied", node: ref(frame.id), kind: "screen" };
   }
   if (operation === "create_component") return createComponent(payload || {});
+  if (operation === "create_node_tree") return createNodeTree(payload || {});
   if (operation === "update_selection") {
     const targetIds = Array.isArray(payload && payload.targetIds) ? payload.targetIds : [];
     const items = targetIds.map((id) => figma.getNodeById(id)).filter(Boolean);
     if (items.length !== targetIds.length) {
-      const error = new Error("One or more write target IDs are unavailable");
-      error.code = "WRITE_TARGET_UNAVAILABLE";
-      throw error;
+      throw writeError("WRITE_TARGET_UNAVAILABLE", "One or more write target IDs are unavailable.");
     }
-    if (!items.length) throw new Error("Figma selection is empty");
-    items.forEach((node) => applyPatch(node, (payload && payload.patch) || {}));
+    if (!items.length) throw writeError("WRITE_TARGET_MISMATCH", "At least one explicit write target is required.");
+    const patch = (payload && payload.patch) || {};
+    items.forEach((node) => validatePatchForNode(node, patch));
+    let parent;
+    if (patch.parentId) {
+      parent = figma.getNodeById(patch.parentId);
+      if (!parent || !isContainerNode(parent)) throw writeError("WRITE_TARGET_UNAVAILABLE", "The requested reparent target is unavailable or cannot contain children.");
+      items.forEach((node) => {
+        if (node === parent) throw writeError("WRITE_TARGET_MISMATCH", "A node cannot be reparented to itself.");
+        let current = parent;
+        while (current) {
+          if (current === node) throw writeError("WRITE_TARGET_MISMATCH", "A node cannot be reparented into its own descendant.");
+          current = current.parent;
+        }
+      });
+    }
+    if (parent) items.forEach((node) => parent.appendChild(node));
+    await Promise.all(items.map((node) => applyPatch(node, patch)));
     return { status: "applied", nodes: items.map((item) => ref(item.id)) };
   }
   throw new Error(`Unsupported Figma write operation: ${operation}`);
@@ -2368,6 +2795,7 @@ async function handleRequest(request) {
         break;
       case "create_screen":
       case "create_component":
+      case "create_node_tree":
       case "update_selection":
         result = await executeWrite(request.operation, request.payload);
         break;

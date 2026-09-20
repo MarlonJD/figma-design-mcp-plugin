@@ -41,6 +41,29 @@ The host-specific escape hatch is `hostData`. It is for useful information that
 does not yet belong in the shared vocabulary; consumers should not depend on it
 when a normalized field exists.
 
+## Bounded authoring
+
+Figma exposes `design.create_node_tree` for a small native authoring slice:
+frame, text, rectangle, and component nodes; explicit caller-local references;
+current-page roots; nested parent relationships; solid fills; essential strokes
+and corner radii; editable text and typography; and horizontal/vertical
+Auto Layout. The operation returns every created host ID and its reference map.
+It requires a complete `expectedSnapshotId`, is bounded to 256 nodes, depth 12,
+20,000 characters per text node, and a 2 MB JSON payload, and cleans up only
+task-created nodes if mutation fails.
+
+`design.update_selection` is an explicit-ID update despite its historical tool
+name. `targetIds` must belong to the complete expected capture scope, but the
+current selection may change. Its public `sessionId` selects the bridge
+connection from `design.list_hosts`; `captureSessionId` is the native session
+from `snapshot.identity.sessionId` and is mapped into the native write guard.
+Document/session/page scope and document revision checks remain mandatory.
+Figma text updates load existing and requested fonts before changing characters
+or typography. Font weight is expressed through the requested font style because
+Figma exposes the numeric weight as read-only.
+XD reports node-tree, typography, and Auto Layout authoring as unsupported; it
+does not substitute a plain group or claim a write succeeded.
+
 ## Layout interpretation
 
 An agent should translate layout evidence into the target platform's semantic

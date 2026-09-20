@@ -7,7 +7,7 @@ const { Artboard, Rectangle, Text, Color } = scenegraph;
 
 const BRIDGE_URL = "ws://127.0.0.1:5514";
 const BRIDGE_PROTOCOL_VERSION = 2;
-const PLUGIN_VERSION = "0.4.0";
+const PLUGIN_VERSION = "0.5.0";
 const PAIRING_TOKEN = "designport-local-pairing";
 const MAX_ASSET_EXPORTS_PER_REQUEST = 64;
 const MAX_PENDING_WRITES = 32;
@@ -30,9 +30,13 @@ const CAPABILITIES = {
     "incremental-snapshots",
     "bounded-asset-retrieval",
     "capture-consistency",
+    "explicit-node-updates",
   ],
   limitations: [
     "component-creation-unsupported",
+    "node-tree-authoring-unsupported",
+    "auto-layout-authoring-unsupported",
+    "typography-updates-unsupported",
     "component-state-coverage-depends-on-xd-uxp-surface",
     "interaction-api-excludes-hover-and-component-state-transitions",
   ],
@@ -53,6 +57,7 @@ const CAPABILITIES = {
     selectionRead: true,
     createScreen: true,
     createComponent: false,
+    createNodeTree: false,
     updateSelection: true,
     userActionRequiredForWrite: true,
     visualRead: true,
@@ -2119,24 +2124,22 @@ function validateWriteState(payload, selection, operation) {
   }
   if (!baseline.snapshot.complete
     || baseline.snapshot.identity.documentId !== info.documentId
-    || baseline.snapshot.documentRevision !== snapshotState.documentRevision
-    || baseline.snapshot.selectionRevision !== snapshotState.selectionRevision) {
+    || baseline.snapshot.documentRevision !== snapshotState.documentRevision) {
     const error = new Error("The expected capture is stale; read a fresh capture before writing");
     error.code = "WRITE_STALE_CAPTURE";
     throw error;
   }
   if (operation === "update_selection") {
     const targetIds = Array.isArray(payload.targetIds) ? payload.targetIds : [];
-    if (!targetIds.every((id) => baseline.snapshot.identity.selectedIds.includes(id))) {
-      const error = new Error("Write targets are not members of the expected selection capture");
+    const capturedIds = new Set((baseline.nodes || []).map((node) => node.id));
+    if (!targetIds.length || new Set(targetIds).size !== targetIds.length || !targetIds.every((id) => capturedIds.has(id))) {
+      const error = new Error("Write targets must be explicit nodes in the expected capture scope");
       error.code = "WRITE_TARGET_MISMATCH";
       throw error;
     }
-    const currentIds = (selection.items || []).map((item) => nodeId(item)).filter(Boolean);
-    if (currentIds.length !== baseline.snapshot.identity.selectedIds.length
-      || currentIds.some((id) => !baseline.snapshot.identity.selectedIds.includes(id))) {
-      const error = new Error("The XD selection changed after the write was queued");
-      error.code = "WRITE_SELECTION_CHANGED";
+    if (payload.patch && payload.patch.parentId && !capturedIds.has(payload.patch.parentId)) {
+      const error = new Error("A reparent target must be in the expected capture scope");
+      error.code = "WRITE_TARGET_MISMATCH";
       throw error;
     }
   }
@@ -2173,14 +2176,8 @@ function executeWrite(operation, payload, selection, documentRoot) {
       error.code = "WRITE_TARGET_UNAVAILABLE";
       throw error;
     }
-    if (!selection.items || !selection.items.length) {
-      const error = new Error("XD selection is empty");
-      error.code = "EMPTY_SELECTION";
-      throw error;
-    }
     const patch = (payload && payload.patch) || {};
     items.forEach((node) => applyPatch(node, patch));
-    selection.items = items;
     return { status: "applied", nodes: items.map((item) => ({ host: "xd", id: nodeId(item) })) };
   }
 
@@ -2317,6 +2314,11 @@ async function handleRequest(request) {
       case "update_selection":
         queueWrite(request);
         return;
+      case "create_node_tree": {
+        const error = new Error("XD cannot author a bounded native node tree through the public UXP surface");
+        error.code = "XD_NODE_TREE_AUTHORING_UNSUPPORTED";
+        throw error;
+      }
       case "create_component": {
         const error = new Error("XD cannot create a new component definition through the plugin API");
         error.code = "XD_COMPONENT_CREATION_UNSUPPORTED";

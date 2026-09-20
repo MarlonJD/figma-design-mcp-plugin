@@ -29,8 +29,26 @@ signals an agent needs to reconstruct a responsive interface: paint stacks
 and gradients, image/vector assets, typography, corner radii, effects,
 constraints, auto-layout/grid metadata, absolute positioning, and prototype
 links when the document exposes them. It can also create basic
-screens/components and apply supported selection patches. Figma writes are
-applied immediately by the plugin.
+screens/components, create a bounded native node tree, and apply supported
+explicit-ID patches. Figma writes are applied immediately by the plugin.
+
+`design.create_node_tree` accepts frame, text, rectangle, and component nodes
+with caller-local references. It supports solid fills, essential strokes and
+corner radii, editable text, font-aware typography, and horizontal/vertical
+Auto Layout with gap, padding, alignment, and fixed/hug/fill sizing. It is
+bounded to 256 nodes, depth 12, 20,000 characters per text node, and a 2 MB
+JSON payload. Roots are created on the current page without depending on the
+current selection; a failed task removes only nodes created by that task.
+
+`design.update_selection` now addresses explicit IDs present in the expected
+complete snapshot scope. The public bridge session selector and the native
+snapshot session are separate: callers select the connection with `sessionId`
+and pass `snapshot.identity.sessionId` as `captureSessionId`. It does not
+require the nodes to remain selected and supports text, typography, geometry,
+solid fills, essential stroke/corner properties, and the supported Auto Layout
+fields. Prototype authoring and component instance/variant authoring remain
+deferred. Font weight is set by choosing a font style because Figma exposes
+`fontWeight` as read-only.
 
 The export also includes local variables/styles as `tokens`, node style and
 variable bindings, mixed text style ranges, component properties and variant

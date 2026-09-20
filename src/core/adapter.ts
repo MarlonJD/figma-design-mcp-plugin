@@ -12,6 +12,8 @@ import {
   type HostCapabilities,
   type HostKind,
   type ExportOptions,
+  nodeTreeSpecSchema,
+  type NodeTreeSpec,
   type VisualContext,
   exportOptionsSchema,
   screenSpecSchema,
@@ -37,6 +39,7 @@ export interface DesignHostAdapter {
   ): Promise<DesignIR | ContextIR>;
   createScreen(spec: ScreenSpec & { expectedSnapshotId: string }): Promise<unknown>;
   createComponent(spec: ComponentSpec & { expectedSnapshotId: string }): Promise<unknown>;
+  createNodeTree(spec: NodeTreeSpec & { expectedSnapshotId: string }): Promise<unknown>;
   updateSelection(payload: {
     patch: DesignPatch;
     targetIds: string[];
@@ -116,6 +119,12 @@ export class BridgeHostAdapter implements DesignHostAdapter {
     }).parse(spec));
   }
 
+  async createNodeTree(spec: NodeTreeSpec & { expectedSnapshotId: string }): Promise<unknown> {
+    return this.bridge.request(this.host, "create_node_tree", nodeTreeSpecSchema.extend({
+      expectedSnapshotId: z.string().min(1),
+    }).parse(spec));
+  }
+
   async updateSelection(payload: {
     patch: DesignPatch;
     targetIds: string[];
@@ -123,6 +132,13 @@ export class BridgeHostAdapter implements DesignHostAdapter {
     documentId?: string;
     sessionId?: string;
   }): Promise<unknown> {
-    return this.bridge.request(this.host, "update_selection", payload);
+    const normalized = z.object({
+      patch: designPatchSchema,
+      targetIds: z.array(z.string().min(1)).min(1).max(2000),
+      expectedSnapshotId: z.string().min(1),
+      documentId: z.string().min(1).optional(),
+      sessionId: z.string().min(1).optional(),
+    }).strict().parse(payload);
+    return this.bridge.request(this.host, "update_selection", normalized);
   }
 }

@@ -14,9 +14,11 @@ machine and the MCP clients that are allowed to launch it.
   provide remote or cloud transport.
 - A connected plugin can send selected or document design context to the
   local bridge.
-- `design.create_screen`, `design.create_component`, and
-  `design.update_selection` can change an active design document when the host
-  supports the operation.
+- `design.create_screen`, `design.create_component`,
+  `design.create_node_tree`, and `design.update_selection` can change an active
+  design document when the host supports the operation. Node-tree creation is
+  bounded and requires a complete expected snapshot; explicit updates are
+  scoped to IDs in that snapshot rather than the live selection.
 - The event log is in memory, bounded, and metadata-only; it is not a
   compliance or audit system.
 

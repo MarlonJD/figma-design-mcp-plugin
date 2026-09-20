@@ -73,7 +73,11 @@ integration.
   node-level IR.
 - Report connected hosts, capabilities, and recent host events.
 - Create screens and basic components through host adapters.
-- Apply a normalized patch to the current selection.
+- Create a bounded native Figma node tree with explicit local references,
+  nested children, editable text, solid styling, and horizontal/vertical
+  Auto Layout.
+- Apply a normalized patch to explicit node IDs from a captured scope,
+  including text, typography, geometry, and supported Auto Layout fields.
 - Return properties and visual context together for agent review.
 - Compare implementation screenshots with a deterministic local PNG diff.
 - Keep the bridge on loopback (`127.0.0.1`) by default.
@@ -96,7 +100,8 @@ The available MCP tools are:
 | `design.get_design_context` | Return DesignIR properties and the visual PNG together. |
 | `design.create_screen` | Create an artboard/screen. |
 | `design.create_component` | Create a basic component or symbol where supported. |
-| `design.update_selection` | Apply a normalized patch to the current selection. |
+| `design.create_node_tree` | Create a bounded native Figma node tree; unsupported on XD. |
+| `design.update_selection` | Apply a normalized patch to explicit IDs from the expected snapshot scope; selection is not required. Public `sessionId` selects the bridge connection and `captureSessionId` carries the native snapshot session. |
 | `design.ping` | Check that a host can receive requests. |
 
 See [EXAMPLES.md](EXAMPLES.md) for ready-to-copy tool arguments and common
@@ -167,10 +172,15 @@ and failed token evidence. Snapshot identity includes the plugin session,
 document, page/scope roots, selected IDs, normalization version, and evidence
 shape; old v1 snapshots are not compatible.
 
-Every write requires `expectedSnapshotId`. Selection updates also require
-explicit `targetIds`, so a queued or delayed operation cannot silently apply to
-a later selection. XD writes remain user-applied and expose a `pendingId` for
-`design.get_operation_status`.
+Every write requires `expectedSnapshotId`. Explicit node updates require
+`targetIds` that were present in the complete captured scope, so a queued or
+delayed operation cannot silently apply to a different document or node. A
+selection change does not invalidate an explicit-ID update; a document
+revision, session, document, or page-scope change does. The Figma node-tree
+operation creates only its own bounded task nodes and removes them on a failed
+creation attempt. XD reports node-tree authoring and typography/layout writes
+as unsupported; its existing write requests remain user-applied and expose a
+`pendingId` for `design.get_operation_status`.
 
 ## Requirements
 
@@ -262,7 +272,10 @@ The bridge must be running before the plugin connects.
 
 The plugin uses a hidden UI iframe for the localhost WebSocket connection, so
 no permanent panel is expected. Ask the MCP client to call
-`design.list_hosts`; it should report a connected `figma` host.
+`design.list_hosts`; it should report a connected `figma` host. Figma reports
+`create_node_tree` and explicit text/layout updates as supported, with
+prototype authoring and reusable instance/variant authoring explicitly
+deferred.
 
 #### Adobe XD
 

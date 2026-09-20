@@ -43,6 +43,13 @@ XD does not expose an API for creating a new component definition or
 `SymbolInstance` directly. The adapter reports that capability as unsupported
 instead of pretending that a plain group is a component.
 
+The bounded native node-tree authoring operation is also unsupported on XD's
+public UXP surface. XD reports `createNodeTree: false` and omits the operation
+from its advertised operation list. Explicit node updates remain available for
+the supported name, visibility, opacity, solid-fill, text, and geometry fields;
+typography, Auto Layout, reparenting, stroke, and corner authoring are rejected
+with an explicit unsupported-field error rather than being silently ignored.
+
 XD does not expose every Figma component-state concept through its public UXP
 surface. Unsupported component creation and unavailable state data are
 reported as limitations; the adapter never substitutes a plain group or

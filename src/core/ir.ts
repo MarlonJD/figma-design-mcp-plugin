@@ -581,6 +581,7 @@ export const hostCapabilitiesSchema = z.object({
     selectionRead: z.boolean(),
     createScreen: z.boolean(),
     createComponent: z.boolean(),
+    createNodeTree: z.boolean(),
     updateSelection: z.boolean(),
     userActionRequiredForWrite: z.boolean(),
     visualRead: z.boolean().optional(),
@@ -651,6 +652,209 @@ export const contextIRSchema = z.object({
 });
 export type ContextIR = z.infer<typeof contextIRSchema>;
 
+const authoringReferenceSchema = z.string()
+  .min(1)
+  .max(80)
+  .regex(/^[A-Za-z][A-Za-z0-9_.-]*$/, "References must start with a letter and contain only letters, numbers, dots, underscores, or hyphens.");
+
+const authoringColorSchema = colorSchema.strict();
+
+export const authoringNodeKindSchema = z.enum([
+  "frame",
+  "text",
+  "rectangle",
+  "component",
+]);
+export type AuthoringNodeKind = z.infer<typeof authoringNodeKindSchema>;
+
+const authoringPaddingSchema = z.object({
+  top: z.number().finite().nonnegative(),
+  right: z.number().finite().nonnegative(),
+  bottom: z.number().finite().nonnegative(),
+  left: z.number().finite().nonnegative(),
+}).strict();
+
+const authoringStrokeSchema = z.object({
+  color: authoringColorSchema,
+  weight: z.number().finite().nonnegative().max(1000).default(1),
+  position: z.enum(["inside", "outside", "center"]).default("inside"),
+}).strict();
+export type AuthoringStroke = z.infer<typeof authoringStrokeSchema>;
+
+const authoringLayoutFields = {
+  mode: z.enum(["none", "horizontal", "vertical"]),
+  gap: z.number().finite().nonnegative().max(10000).optional(),
+  padding: authoringPaddingSchema.optional(),
+  sizingHorizontal: z.enum(["fixed", "hug", "fill"]).optional(),
+  sizingVertical: z.enum(["fixed", "hug", "fill"]).optional(),
+  primaryAxisAlign: z.enum(["min", "center", "max", "space-between"]).optional(),
+  counterAxisAlign: z.enum(["min", "center", "max", "baseline"]).optional(),
+  wrap: z.enum(["no-wrap", "wrap"]).optional(),
+  counterAxisSpacing: z.number().finite().nonnegative().max(10000).optional(),
+};
+
+export const authoringLayoutSchema = z.object({
+  ...authoringLayoutFields,
+  mode: authoringLayoutFields.mode.default("none"),
+}).strict();
+export type AuthoringLayout = z.infer<typeof authoringLayoutSchema>;
+
+export const authoringLayoutPatchSchema = z.object({
+  ...authoringLayoutFields,
+  mode: authoringLayoutFields.mode.optional(),
+}).strict();
+export type AuthoringLayoutPatch = z.infer<typeof authoringLayoutPatchSchema>;
+
+export const authoringTypographySchema = z.object({
+  family: z.string().min(1).max(120).optional(),
+  style: z.string().min(1).max(120).optional(),
+  size: z.number().finite().positive().max(1000).optional(),
+  lineHeight: z.number().finite().positive().max(10000).optional(),
+  letterSpacing: z.number().finite().max(10000).optional(),
+  align: z.enum(["left", "center", "right", "justified"]).optional(),
+  alignVertical: z.enum(["top", "center", "bottom"]).optional(),
+  decoration: z.enum(["none", "underline", "strikethrough"]).optional(),
+  textCase: z.enum(["original", "upper", "lower", "title", "small-caps", "small-caps-forced"]).optional(),
+  autoResize: z.enum(["none", "width-and-height", "height", "truncate"]).optional(),
+  textTruncation: z.enum(["disabled", "ending"]).optional(),
+  maxLines: z.number().int().positive().max(1000).optional(),
+  paragraphIndent: z.number().finite().max(10000).optional(),
+  paragraphSpacing: z.number().finite().nonnegative().max(10000).optional(),
+}).strict();
+export type AuthoringTypography = z.infer<typeof authoringTypographySchema>;
+
+const authoringCornerRadiiSchema = z.object({
+  topLeft: z.number().finite().nonnegative().max(10000),
+  topRight: z.number().finite().nonnegative().max(10000),
+  bottomRight: z.number().finite().nonnegative().max(10000),
+  bottomLeft: z.number().finite().nonnegative().max(10000),
+}).strict();
+
+export const authoringNodeSchema = z.object({
+  ref: authoringReferenceSchema,
+  kind: authoringNodeKindSchema,
+  parentRef: authoringReferenceSchema.optional(),
+  name: z.string().min(1).max(200),
+  x: z.number().finite().optional(),
+  y: z.number().finite().optional(),
+  width: z.number().finite().positive().max(100000).optional(),
+  height: z.number().finite().positive().max(100000).optional(),
+  fill: authoringColorSchema.optional(),
+  stroke: authoringStrokeSchema.optional(),
+  cornerRadius: z.number().finite().nonnegative().max(10000).optional(),
+  cornerRadii: authoringCornerRadiiSchema.optional(),
+  opacity: z.number().min(0).max(1).optional(),
+  visible: z.boolean().optional(),
+  text: z.string().max(20000).optional(),
+  typography: authoringTypographySchema.optional(),
+  layout: authoringLayoutSchema.optional(),
+  positioning: z.enum(["auto", "absolute"]).default("auto"),
+  clipsContent: z.boolean().optional(),
+}).strict().superRefine((node, context) => {
+  if (node.kind === "text" && node.text === undefined) {
+    context.addIssue({ code: "custom", path: ["text"], message: "Text nodes require text." });
+  }
+  if (node.kind !== "text" && (node.text !== undefined || node.typography !== undefined)) {
+    context.addIssue({ code: "custom", path: ["text"], message: "Only text nodes may set text or typography." });
+  }
+  if (node.kind !== "frame" && node.kind !== "component" && node.layout?.mode !== undefined && node.layout.mode !== "none") {
+    context.addIssue({ code: "custom", path: ["layout", "mode"], message: "Only frame and component nodes may own auto layout." });
+  }
+  if (node.kind === "text" && node.layout?.mode !== undefined && node.layout.mode !== "none") {
+    context.addIssue({ code: "custom", path: ["layout", "mode"], message: "Text nodes cannot own auto layout." });
+  }
+  if (node.positioning === "absolute" && !node.parentRef) {
+    context.addIssue({ code: "custom", path: ["positioning"], message: "Absolute positioning requires a parent reference." });
+  }
+  if (node.cornerRadius !== undefined && node.cornerRadii !== undefined) {
+    context.addIssue({ code: "custom", path: ["cornerRadii"], message: "Use cornerRadius or cornerRadii, not both." });
+  }
+});
+export type AuthoringNode = z.infer<typeof authoringNodeSchema>;
+
+export const nodeTreeSpecSchema = z.object({
+  nodes: z.array(authoringNodeSchema).min(1).max(256),
+}).strict().superRefine((spec, context) => {
+  const jsonLength = JSON.stringify(spec).length;
+  if (jsonLength > 2_000_000) {
+    context.addIssue({ code: "custom", path: [], message: "Node-tree payload exceeds the 2 MB authoring limit." });
+  }
+
+  const byRef = new Map<string, AuthoringNode>();
+  spec.nodes.forEach((node, index) => {
+    if (byRef.has(node.ref)) {
+      context.addIssue({ code: "custom", path: ["nodes", index, "ref"], message: `Duplicate node reference: ${node.ref}.` });
+    }
+    byRef.set(node.ref, node);
+  });
+
+  const roots = spec.nodes.filter((node) => !node.parentRef);
+  if (roots.length > 32) {
+    context.addIssue({ code: "custom", path: ["nodes"], message: "A node-tree request may contain at most 32 roots." });
+  }
+
+  const depthFor = (node: AuthoringNode, path: string[], depth: number): void => {
+    if (depth > 12) {
+      context.addIssue({ code: "custom", path: ["nodes"], message: "Node-tree depth may not exceed 12." });
+      return;
+    }
+    if (!node.parentRef) return;
+    const parent = byRef.get(node.parentRef);
+    if (!parent) {
+      context.addIssue({ code: "custom", path: ["nodes", ...path, "parentRef"], message: `Unknown parent reference: ${node.parentRef}.` });
+      return;
+    }
+    if (path.includes(parent.ref)) {
+      context.addIssue({ code: "custom", path: ["nodes"], message: "Node-tree parent relationships may not contain cycles." });
+      return;
+    }
+    depthFor(parent, [...path, parent.ref], depth + 1);
+  };
+
+  spec.nodes.forEach((node, index) => {
+    const parent = node.parentRef ? byRef.get(node.parentRef) : undefined;
+    if (node.parentRef && !parent) {
+      context.addIssue({ code: "custom", path: ["nodes", index, "parentRef"], message: `Unknown parent reference: ${node.parentRef}.` });
+      return;
+    }
+    if (parent && parent.kind !== "frame" && parent.kind !== "component") {
+      context.addIssue({ code: "custom", path: ["nodes", index, "parentRef"], message: "Only frame and component nodes may have children." });
+    }
+    depthFor(node, [node.ref], 1);
+
+    const parentLayout = parent?.layout?.mode;
+    const layout = node.layout;
+    const hasSizing = Boolean(layout?.sizingHorizontal || layout?.sizingVertical);
+    if (hasSizing && !parentLayout && node.kind === "rectangle") {
+      context.addIssue({ code: "custom", path: ["nodes", index, "layout"], message: "Rectangle sizing requires an auto-layout parent." });
+    }
+    if (hasSizing && parentLayout === undefined && node.kind === "frame" && layout?.mode === "none") {
+      context.addIssue({ code: "custom", path: ["nodes", index, "layout"], message: "A frame with sizing must own auto layout or be inside an auto-layout parent." });
+    }
+    if (layout?.sizingHorizontal === "fill" || layout?.sizingVertical === "fill") {
+      if (!parentLayout || parentLayout === "none") {
+        context.addIssue({ code: "custom", path: ["nodes", index, "layout"], message: "Fill sizing requires an auto-layout parent." });
+      }
+    }
+    if ((layout?.sizingHorizontal === "hug" || layout?.sizingVertical === "hug")
+      && node.kind !== "text"
+      && layout?.mode === "none") {
+      context.addIssue({ code: "custom", path: ["nodes", index, "layout"], message: "Hug sizing requires a text node or an auto-layout frame/component." });
+    }
+    if (parentLayout && parentLayout !== "none" && node.positioning === "auto" && (node.x !== undefined || node.y !== undefined)) {
+      context.addIssue({ code: "custom", path: ["nodes", index], message: "Flow children cannot set x/y; use absolute positioning for overlays." });
+    }
+    if (node.positioning === "absolute" && (!parentLayout || parentLayout === "none")) {
+      context.addIssue({ code: "custom", path: ["nodes", index, "positioning"], message: "Absolute positioning requires an auto-layout parent." });
+    }
+    if (layout?.mode === "none" && (layout.gap !== undefined || layout.padding !== undefined || layout.primaryAxisAlign !== undefined
+      || layout.counterAxisAlign !== undefined || layout.wrap !== undefined || layout.counterAxisSpacing !== undefined)) {
+      context.addIssue({ code: "custom", path: ["nodes", index, "layout"], message: "Gap, padding, and alignment require horizontal or vertical auto layout." });
+    }
+  });
+});
+export type NodeTreeSpec = z.infer<typeof nodeTreeSpecSchema>;
+
 export const screenSpecSchema = z.object({
   name: z.string().min(1).max(200),
   width: z.number().finite().positive().default(1440),
@@ -678,8 +882,13 @@ export const designPatchSchema = z.object({
   visible: z.boolean().optional(),
   opacity: z.number().min(0).max(1).optional(),
   fills: z.array(fillSchema).optional(),
-  text: z.string().optional(),
-  typography: typographySchema.optional(),
+  text: z.string().max(20000).optional(),
+  typography: authoringTypographySchema.optional(),
+  layout: authoringLayoutPatchSchema.optional(),
+  parentId: z.string().min(1).optional(),
+  stroke: authoringStrokeSchema.optional(),
+  cornerRadius: z.number().finite().nonnegative().max(10000).optional(),
+  cornerRadii: authoringCornerRadiiSchema.optional(),
 }).strict();
 export type DesignPatch = z.infer<typeof designPatchSchema>;
 

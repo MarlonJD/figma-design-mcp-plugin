@@ -23,8 +23,8 @@ function nextMessage(socket: WebSocket): Promise<Record<string, unknown>> {
 }
 
 function closed(socket: WebSocket): Promise<void> {
-  if (socket.readyState === WebSocket.CLOSED) return Promise.resolve();
-  return new Promise((resolve) => socket.once("close", () => resolve()));
+  if (socket.readyState === WebSocket.CLOSED) return new Promise((resolve) => setImmediate(resolve));
+  return new Promise((resolve) => socket.once("close", () => setImmediate(resolve)));
 }
 
 function hello(
@@ -49,6 +49,7 @@ function hello(
         selectionRead: true,
         createScreen: host === "figma",
         createComponent: host === "figma",
+        createNodeTree: host === "figma",
         updateSelection: true,
         userActionRequiredForWrite: host === "xd",
       },
@@ -196,11 +197,12 @@ test("bridge times out pending requests and rejects writes after disconnect", as
   await nextMessage(socket);
   const request = bridge.request("xd", "ping", {});
   await nextMessage(socket);
-  socket.close();
-  await closed(socket);
-  await assert.rejects(
+  const pendingRejection = assert.rejects(
     request,
     (error: unknown) => error instanceof Error && error.message.includes("disconnected"),
   );
+  socket.close();
+  await closed(socket);
+  await pendingRejection;
   await bridge.stop();
 });
